@@ -1,5 +1,7 @@
 //! Status and job-query JSON types for Python and agent consumption.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::contract::Response;
@@ -32,6 +34,29 @@ pub enum CiClass {
     Pending,
     /// CI status could not be determined.
     Unknown,
+}
+
+impl fmt::Display for ProcessState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        })
+    }
+}
+
+impl fmt::Display for CiClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Pending => "pending",
+            Self::Unknown => "unknown",
+        })
+    }
 }
 
 /// Status of a single watched job.
