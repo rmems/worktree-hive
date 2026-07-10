@@ -272,3 +272,8 @@ id_ed25519
 credentials.json
 secrets.json
 .secrets/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
