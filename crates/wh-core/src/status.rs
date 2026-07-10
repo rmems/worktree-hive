@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::contract::{Response, SCHEMA_VERSION};
+use crate::contract::Response;
 
 /// Lifecycle state of a watched job process.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -81,6 +81,7 @@ pub fn status_response(command: &'static str, jobs: Vec<JobStatus>) -> Response<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::SCHEMA_VERSION;
 
     fn sample_job() -> JobStatus {
         JobStatus {
