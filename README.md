@@ -9,15 +9,18 @@ The repository is in its foundation phase. The Rust workspace is available; the 
 
 ## Architecture
 
+worktrees-hives is a **Python/Rust hybrid**. Rust owns performance, memory discipline, and hard safety enforcement. Python owns orchestration policy, agent glue, and human-readable reporting. Agent skills (`SKILL.md`) describe when and how agents call the tooling.
+
 ```text
 Agent platform / SKILL.md
           |
+          | intent and operator context
           v
 Python orchestrator (worktrees_hives)
-          | CLI + JSON envelope v1
+          | wh subprocess calls + JSON envelope v1
           v
 Rust CLI (wh) / wh-core
-          |
+          | allowlisted subprocess operations
           v
 git / gh / operating system
 ```
@@ -29,7 +32,11 @@ git / gh / operating system
 | Rust `wh-core` + `wh` | Worktrees, durable job state, process supervision, path sandboxing, branch verification, and hard git/GitHub safety stops | High-level agent policy |
 | `git`, `gh`, OS | Version-control, GitHub, and process primitives invoked through Rust | Hive policy |
 
-The Python/Rust boundary is CLI-first and uses versioned JSON instead of PyO3. The v1 contract is tracked in [GitHub #40](https://github.com/rmems/worktrees-hives/issues/40); its documentation will live at `docs/json-contract.md`.
+**Why a hybrid?** Rust enforces safety-sensitive mutation rules (never-merge, force-with-lease, branch verification, path sandboxing) at the binary boundary where a malformed prompt or Python bug cannot bypass them. Python handles the orchestration logic that benefits from rapid iteration and rich ecosystem tooling. The agent skill layer remains portable across platforms.
+
+The Python/Rust boundary is CLI-first and uses versioned JSON instead of PyO3. The contract is versioned independently so Python and Rust can evolve without sharing an in-process ABI. The v1 contract is tracked in [GitHub #40](https://github.com/rmems/worktrees-hives/issues/40); its documentation will live at `docs/json-contract.md`.
+
+See [`AGENTS.md`](AGENTS.md) for detailed source ownership, data flow, and per-layer responsibilities.
 
 ## Safety invariants
 

@@ -42,7 +42,11 @@ For stacked pull requests, review and fix the bottom PR before its children. Re-
 - [ ] New behavior has focused tests, including negative policy tests where relevant.
 - [ ] Documentation and examples match the implemented command surface.
 
-## Rust review notes
+## Language-specific review notes
+
+worktrees-hives is a Python/Rust hybrid. Each layer has distinct review concerns:
+
+### Rust review notes
 
 Rust owns the hard safety boundary. Reviewers should check:
 
@@ -64,7 +68,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-## Python review notes
+### Python review notes
 
 Python owns orchestration policy. Reviewers should check:
 
@@ -85,7 +89,7 @@ cd python
 pytest
 ```
 
-## Agent-skill review notes
+### Agent-skill review notes
 
 Skill text is a portable operator interface, not enforcement. Verify that it:
 
