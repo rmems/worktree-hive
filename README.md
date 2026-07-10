@@ -47,12 +47,7 @@ Soft prompt text is not considered enforcement. Hard stops belong in Rust so a m
 
 ## Owner allowlist
 
-By default, discovery and mutation are limited to:
-
-- `rmems/*`
-- `Limen-Neural/*`
-
-An explicit user override is required for any other owner. Authentication should use the least privileges needed by `git` and `gh`; credentials must never be written to reports or logs.
+By default, discovery and mutation are limited to the configured owner allowlist. An explicit user override is required for any other owner. Authentication should use the least privileges needed by `git` and `gh`; credentials must never be written to reports or logs.
 
 ## Build and install `wh`
 
@@ -62,7 +57,7 @@ Prerequisites:
 - Git
 - GitHub CLI for future GitHub operations
 
-The workspace MSRV is Rust **1.85**. `rust-toolchain.toml` selects the latest stable toolchain for development and CI.
+The workspace MSRV is Rust **1.97**. `rust-toolchain.toml` pins development and CI to the stable Rust 1.97 toolchain.
 
 ```bash
 cargo build --workspace

@@ -11,10 +11,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub enum Error {
     /// A path segment was invalid for sandbox derivation.
-    InvalidSegment {
-        field: &'static str,
-        value: String,
-    },
+    InvalidSegment { field: &'static str, value: String },
     /// A candidate path escaped or violated sandbox rules.
     SandboxViolation {
         base: PathBuf,
@@ -27,10 +24,7 @@ pub enum Error {
         source: io::Error,
     },
     /// A git subprocess command failed.
-    GitCommand {
-        args: Vec<String>,
-        stderr: String,
-    },
+    GitCommand { args: Vec<String>, stderr: String },
 }
 
 impl Display for Error {

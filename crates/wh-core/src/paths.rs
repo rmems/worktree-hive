@@ -41,15 +41,16 @@ fn default_worktree_base() -> Result<PathBuf> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let data_home = env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| {
-            PathBuf::from(
-                env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("~")),
-            )
-            .join(".local")
-            .join("share")
-        });
+        let data_home = match env::var_os("XDG_DATA_HOME") {
+            Some(v) => PathBuf::from(v),
+            None => {
+                let home = env::var_os("HOME").ok_or_else(|| Error::Io {
+                    context: "resolve HOME",
+                    source: std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"),
+                })?;
+                PathBuf::from(home).join(".local").join("share")
+            }
+        };
 
         Ok(data_home.join("worktrees-hives").join("worktrees"))
     }
@@ -65,20 +66,22 @@ pub fn derive_worktree_path(base: &Path, owner: &str, repo: &str, job_id: &str) 
 }
 
 pub(crate) fn validate_segment(field: &'static str, value: &str) -> Result<()> {
-    if value.is_empty() || value == "." || value == ".." {
+    let invalid = value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.chars().any(std::path::is_separator)
+        // Reject drive prefixes / absolute components (e.g. `C:`, `C:foo`).
+        || Path::new(value).components().count() != 1
+        || !matches!(
+            Path::new(value).components().next(),
+            Some(std::path::Component::Normal(s)) if s == value
+        );
+    if invalid {
         return Err(Error::InvalidSegment {
             field,
             value: value.to_owned(),
         });
     }
-
-    if value.chars().any(std::path::is_separator) {
-        return Err(Error::InvalidSegment {
-            field,
-            value: value.to_owned(),
-        });
-    }
-
     Ok(())
 }
 
