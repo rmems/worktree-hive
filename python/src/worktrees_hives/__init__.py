@@ -11,9 +11,18 @@ from worktrees_hives.errors import (
     WhProcessError,
     WhSchemaError,
 )
+from worktrees_hives.orchestrator import (
+    Orchestrator,
+    OrchestratorReport,
+    WorkerResult,
+    WorkerSpec,
+    WorkerStatus,
+)
 
 __all__ = [
     "ErrorResponse",
+    "Orchestrator",
+    "OrchestratorReport",
     "Response",
     "SuccessResponse",
     "WhBinaryNotFoundError",
@@ -22,4 +31,7 @@ __all__ = [
     "WhJsonDecodeError",
     "WhProcessError",
     "WhSchemaError",
+    "WorkerResult",
+    "WorkerSpec",
+    "WorkerStatus",
 ]

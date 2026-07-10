@@ -1,0 +1,291 @@
+"""Tests for the multi-subagent orchestrator."""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from worktrees_hives.orchestrator import (
+    Orchestrator,
+    OrchestratorReport,
+    WorkerResult,
+    WorkerSpec,
+    WorkerStatus,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _ok(value: str = "done", delay: float = 0.0) -> str:
+    await asyncio.sleep(delay)
+    return value
+
+
+async def _fail(msg: str = "boom") -> None:
+    raise RuntimeError(msg)
+
+
+async def _hang(delay: float = 999) -> None:
+    await asyncio.sleep(delay)
+
+
+# ---------------------------------------------------------------------------
+# WorkerStatus / WorkerResult basics
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerStatus:
+    def test_enum_values(self):
+        assert WorkerStatus.PENDING.value == "pending"
+        assert WorkerStatus.RUNNING.value == "running"
+        assert WorkerStatus.SUCCEEDED.value == "succeeded"
+        assert WorkerStatus.FAILED.value == "failed"
+        assert WorkerStatus.TIMED_OUT.value == "timed_out"
+        assert WorkerStatus.CANCELLED.value == "cancelled"
+
+
+class TestWorkerResult:
+    def test_defaults(self):
+        r = WorkerResult(worker_id="w1", status=WorkerStatus.SUCCEEDED)
+        assert r.result is None
+        assert r.error is None
+        assert r.elapsed_seconds == 0.0
+
+    def test_frozen(self):
+        r = WorkerResult(worker_id="w1", status=WorkerStatus.SUCCEEDED)
+        with pytest.raises(AttributeError):
+            r.worker_id = "other"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# OrchestratorReport
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorReport:
+    def test_all_succeeded_true(self):
+        report = OrchestratorReport(
+            total=3, succeeded=3, failed=0, timed_out=0,
+            cancelled=0, elapsed_seconds=0.1, results=[],
+        )
+        assert report.all_succeeded is True
+
+    def test_all_succeeded_false(self):
+        report = OrchestratorReport(
+            total=3, succeeded=2, failed=1, timed_out=0,
+            cancelled=0, elapsed_seconds=0.1, results=[],
+        )
+        assert report.all_succeeded is False
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator — constructor validation
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorInit:
+    def test_concurrency_zero_raises(self):
+        with pytest.raises(ValueError, match="concurrency must be >= 1"):
+            Orchestrator(concurrency=0)
+
+    def test_concurrency_negative_raises(self):
+        with pytest.raises(ValueError, match="concurrency must be >= 1"):
+            Orchestrator(concurrency=-1)
+
+    def test_defaults(self):
+        o = Orchestrator()
+        assert o._concurrency == 4
+        assert o._default_timeout is None
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator.run — empty input
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorEmpty:
+    @pytest.mark.asyncio
+    async def test_empty_workers(self):
+        o = Orchestrator()
+        report = await o.run([])
+        assert report.total == 0
+        assert report.all_succeeded is True
+        assert report.elapsed_seconds >= 0
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator.run — success cases
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorSuccess:
+    @pytest.mark.asyncio
+    async def test_single_worker(self):
+        o = Orchestrator(concurrency=2)
+        spec = WorkerSpec(worker_id="w1", fn=_ok, args=("hello",))
+        report = await o.run([spec])
+        assert report.total == 1
+        assert report.succeeded == 1
+        assert report.failed == 0
+        assert report.results[0].result == "hello"
+        assert report.results[0].status == WorkerStatus.SUCCEEDED
+
+    @pytest.mark.asyncio
+    async def test_multiple_workers(self):
+        o = Orchestrator(concurrency=2)
+        specs = [
+            WorkerSpec(worker_id=f"w{i}", fn=_ok, args=(f"r{i}",))
+            for i in range(5)
+        ]
+        report = await o.run(specs)
+        assert report.total == 5
+        assert report.succeeded == 5
+        assert report.all_succeeded is True
+        results_by_id = {r.worker_id: r.result for r in report.results}
+        for i in range(5):
+            assert results_by_id[f"w{i}"] == f"r{i}"
+
+    @pytest.mark.asyncio
+    async def test_concurrency_cap_observed(self):
+        """Verify that no more than `concurrency` workers run simultaneously."""
+        max_concurrent = 0
+        current_concurrent = 0
+        lock = asyncio.Lock()
+
+        async def tracked_worker():
+            nonlocal max_concurrent, current_concurrent
+            async with lock:
+                current_concurrent += 1
+                if current_concurrent > max_concurrent:
+                    max_concurrent = current_concurrent
+            await asyncio.sleep(0.05)
+            async with lock:
+                current_concurrent -= 1
+
+        o = Orchestrator(concurrency=3)
+        specs = [
+            WorkerSpec(worker_id=f"w{i}", fn=tracked_worker)
+            for i in range(10)
+        ]
+        await o.run(specs)
+        assert max_concurrent <= 3
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator.run — failure cases
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorFailure:
+    @pytest.mark.asyncio
+    async def test_worker_failure_does_not_cancel_siblings(self):
+        o = Orchestrator(concurrency=4)
+        specs = [
+            WorkerSpec(worker_id="ok1", fn=_ok, args=("a",)),
+            WorkerSpec(worker_id="fail", fn=_fail, args=("bad news",)),
+            WorkerSpec(worker_id="ok2", fn=_ok, args=("b",)),
+        ]
+        report = await o.run(specs)
+        assert report.total == 3
+        assert report.succeeded == 2
+        assert report.failed == 1
+        fail_result = next(r for r in report.results if r.worker_id == "fail")
+        assert fail_result.status == WorkerStatus.FAILED
+        assert "RuntimeError: bad news" in fail_result.error  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_all_workers_fail(self):
+        o = Orchestrator(concurrency=2)
+        specs = [
+            WorkerSpec(worker_id=f"w{i}", fn=_fail) for i in range(3)
+        ]
+        report = await o.run(specs)
+        assert report.failed == 3
+        assert report.succeeded == 0
+        assert not report.all_succeeded
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator.run — timeout cases
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorTimeout:
+    @pytest.mark.asyncio
+    async def test_default_timeout(self):
+        o = Orchestrator(concurrency=2, default_timeout=0.05)
+        spec = WorkerSpec(worker_id="slow", fn=_hang)
+        report = await o.run([spec])
+        assert report.total == 1
+        assert report.timed_out == 1
+        assert report.results[0].status == WorkerStatus.TIMED_OUT
+        assert "timed out" in report.results[0].error  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_per_worker_timeout(self):
+        o = Orchestrator(concurrency=2)
+        specs = [
+            WorkerSpec(worker_id="fast", fn=_ok, args=("ok",), timeout=1.0),
+            WorkerSpec(worker_id="slow", fn=_hang, timeout=0.05),
+        ]
+        report = await o.run(specs)
+        assert report.succeeded == 1
+        assert report.timed_out == 1
+        fast = next(r for r in report.results if r.worker_id == "fast")
+        slow = next(r for r in report.results if r.worker_id == "slow")
+        assert fast.result == "ok"
+        assert slow.status == WorkerStatus.TIMED_OUT
+
+    @pytest.mark.asyncio
+    async def test_no_timeout_means_wait(self):
+        o = Orchestrator(concurrency=2, default_timeout=None)
+        spec = WorkerSpec(worker_id="w1", fn=_ok, args=("done",), kwargs={"delay": 0.01})
+        report = await o.run([spec])
+        assert report.succeeded == 1
+        assert report.results[0].result == "done"
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator.run — mixed scenarios
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorMixed:
+    @pytest.mark.asyncio
+    async def test_mixed_outcomes(self):
+        o = Orchestrator(concurrency=3, default_timeout=0.1)
+        specs = [
+            WorkerSpec(worker_id="ok", fn=_ok, args=("yep",)),
+            WorkerSpec(worker_id="fail", fn=_fail),
+            WorkerSpec(worker_id="timeout", fn=_hang),
+        ]
+        report = await o.run(specs)
+        assert report.total == 3
+        assert report.succeeded == 1
+        assert report.failed == 1
+        assert report.timed_out == 1
+        assert report.elapsed_seconds > 0
+
+    @pytest.mark.asyncio
+    async def test_worker_receives_kwargs(self):
+        async def echo(a: str, b: str = "default") -> str:
+            return f"{a}-{b}"
+
+        o = Orchestrator(concurrency=2)
+        spec = WorkerSpec(
+            worker_id="w1", fn=echo, args=("hello",), kwargs={"b": "world"}
+        )
+        report = await o.run([spec])
+        assert report.results[0].result == "hello-world"
+
+    @pytest.mark.asyncio
+    async def test_elapsed_seconds_positive(self):
+        o = Orchestrator(concurrency=2)
+        spec = WorkerSpec(worker_id="w1", fn=_ok, kwargs={"delay": 0.01})
+        report = await o.run([spec])
+        assert report.elapsed_seconds >= 0.01
+        assert report.results[0].elapsed_seconds >= 0.01
