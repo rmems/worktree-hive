@@ -21,6 +21,19 @@ enum Command {
     Status,
     /// List all watched jobs (alias for status).
     Jobs,
+    /// Validate and run a git command under safety policy.
+    GitSafe {
+        /// Git arguments after the subcommand (e.g., push --force-with-lease origin main).
+        #[arg(required = true)]
+        args: Vec<String>,
+    },
+
+    /// Validate and run a GitHub CLI command under safety policy.
+    GhSafe {
+        /// gh arguments (e.g., pr create --title "Fix").
+        #[arg(required = true)]
+        args: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -30,21 +43,27 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             let _ = writeln!(io::stderr(), "wh: {error}");
-            ExitCode::FAILURE
+            match &error {
+                wh_core::error::Error::PolicyViolation { .. } => ExitCode::from(2),
+                _ => ExitCode::FAILURE,
+            }
         }
     }
 }
 
 /// Entry point that loads watched state only for status/jobs subcommands.
-fn run(cli: Cli, stdout: &mut impl Write) -> io::Result<()> {
+fn run(cli: Cli, stdout: &mut impl Write) -> wh_core::error::Result<()> {
     match cli.command {
-        Some(cmd) => {
-            let command_name = match cmd {
-                Command::Status => "cli.status",
-                Command::Jobs => "cli.jobs",
-            };
-            run_status(cli.json, command_name, wh_core::state::load_jobs(), stdout)
+        Some(Command::Status) => {
+            run_status(cli.json, "cli.status", wh_core::state::load_jobs(), stdout)
+                .map_err(wh_core::error::Error::from)
         }
+        Some(Command::Jobs) => {
+            run_status(cli.json, "cli.jobs", wh_core::state::load_jobs(), stdout)
+                .map_err(wh_core::error::Error::from)
+        }
+        Some(Command::GitSafe { args }) => run_git_safe(&args, cli.json, stdout),
+        Some(Command::GhSafe { args }) => run_gh_safe(&args, cli.json, stdout),
         None => {
             if cli.json {
                 serde_json::to_writer(
@@ -107,13 +126,57 @@ fn run_with_jobs(
     Ok(())
 }
 
+fn run_git_safe(
+    args: &[String],
+    json: bool,
+    stdout: &mut impl Write,
+) -> wh_core::error::Result<()> {
+    let cmd = wh_core::git_safe::SafeGitCommand::new(args)?;
+
+    if json {
+        let response = wh_core::contract::Response {
+            ok: true,
+            schema_version: wh_core::contract::SCHEMA_VERSION,
+            command: "git.safe",
+            data: wh_core::contract::EmptyData::default(),
+            error: None,
+        };
+        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+    } else {
+        writeln!(stdout, "validated: git {}", cmd.args().join(" "))?;
+    }
+
+    Ok(())
+}
+
+fn run_gh_safe(args: &[String], json: bool, stdout: &mut impl Write) -> wh_core::error::Result<()> {
+    let cmd = wh_core::git_safe::SafeGhCommand::new(args)?;
+
+    if json {
+        let response = wh_core::contract::Response {
+            ok: true,
+            schema_version: wh_core::contract::SCHEMA_VERSION,
+            command: "gh.safe",
+            data: wh_core::contract::EmptyData::default(),
+            error: None,
+        };
+        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+    } else {
+        writeln!(stdout, "validated: gh {}", cmd.args().join(" "))?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
     use std::str;
     use wh_core::status::{CiClass, JobStatus, ProcessState};
 
-    use super::{Cli, run_status, run_with_jobs};
+    use super::{Cli, run, run_status, run_with_jobs};
 
     fn sample_job() -> JobStatus {
         JobStatus {
@@ -146,7 +209,7 @@ mod tests {
         };
         let mut stdout = Vec::new();
 
-        super::run(cli, &mut stdout).unwrap();
+        run(cli, &mut stdout).unwrap();
 
         assert_eq!(
             str::from_utf8(&stdout).unwrap(),
@@ -162,7 +225,7 @@ mod tests {
         };
         let mut stdout = Vec::new();
 
-        super::run(cli, &mut stdout).unwrap();
+        run(cli, &mut stdout).unwrap();
 
         assert!(stdout.is_empty());
     }
@@ -325,5 +388,120 @@ mod tests {
             stdout.is_empty(),
             "human load error should not write a success summary to stdout"
         );
+    }
+
+    #[test]
+    fn git_safe_valid_command() {
+        let cli = Cli {
+            json: false,
+            command: Some(super::Command::GitSafe {
+                args: vec!["status".to_owned()],
+            }),
+        };
+        let mut stdout = Vec::new();
+
+        run(cli, &mut stdout).unwrap();
+
+        let output = str::from_utf8(&stdout).unwrap();
+        assert!(output.contains("validated: git status"));
+    }
+
+    #[test]
+    fn git_safe_json_mode() {
+        let cli = Cli {
+            json: true,
+            command: Some(super::Command::GitSafe {
+                args: vec!["push".to_owned(), "--force-with-lease".to_owned()],
+            }),
+        };
+        let mut stdout = Vec::new();
+
+        run(cli, &mut stdout).unwrap();
+
+        let output = str::from_utf8(&stdout).unwrap();
+        assert!(output.contains("\"ok\":true"));
+        assert!(output.contains("\"command\":\"git.safe\""));
+    }
+
+    #[test]
+    fn git_safe_blocks_merge() {
+        let cli = Cli {
+            json: false,
+            command: Some(super::Command::GitSafe {
+                args: vec!["merge".to_owned(), "feature".to_owned()],
+            }),
+        };
+        let mut stdout = Vec::new();
+
+        let err = run(cli, &mut stdout).unwrap_err();
+        assert!(matches!(
+            err,
+            wh_core::error::Error::PolicyViolation {
+                code: wh_core::error::PolicyCode::MergeBlocked,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn git_safe_blocks_bare_force() {
+        let cli = Cli {
+            json: false,
+            command: Some(super::Command::GitSafe {
+                args: vec!["push".to_owned(), "--force".to_owned()],
+            }),
+        };
+        let mut stdout = Vec::new();
+
+        let err = run(cli, &mut stdout).unwrap_err();
+        assert!(matches!(
+            err,
+            wh_core::error::Error::PolicyViolation {
+                code: wh_core::error::PolicyCode::BareForcePush,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gh_safe_pr_merge_blocked() {
+        let cli = Cli {
+            json: false,
+            command: Some(super::Command::GhSafe {
+                args: vec!["pr".to_owned(), "merge".to_owned()],
+            }),
+        };
+        let mut stdout = Vec::new();
+
+        let err = run(cli, &mut stdout).unwrap_err();
+        assert!(matches!(
+            err,
+            wh_core::error::Error::PolicyViolation {
+                code: wh_core::error::PolicyCode::MergeBlocked,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gh_safe_pr_create_allowed() {
+        let cli = Cli {
+            json: true,
+            command: Some(super::Command::GhSafe {
+                args: vec![
+                    "pr".to_owned(),
+                    "create".to_owned(),
+                    "--title".to_owned(),
+                    "test".to_owned(),
+                ],
+            }),
+        };
+        let mut stdout = Vec::new();
+
+        run(cli, &mut stdout).unwrap();
+
+        let output = str::from_utf8(&stdout).unwrap();
+        assert!(output.contains("\"ok\":true"));
+        assert!(output.contains("\"command\":\"gh.safe\""));
     }
 }
