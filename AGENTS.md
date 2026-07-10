@@ -141,15 +141,17 @@ Use platform-aware XDG/user-data resolution in implementation. Never assume a Li
 
 ## JSON and process boundary
 
-Version 1 responses use this envelope shape:
+**Status: Planned / not yet implemented.** The features below are documented requirements for the v1 contract (GitHub #40).
+
+Version 1 responses will use this envelope shape:
 
 ```json
 {"ok":true,"schema_version":1,"command":"state.show","data":{},"error":null}
 ```
 
-- Standard output is machine-readable JSON when `--json` is selected.
-- Diagnostics belong on standard error.
-- Additive fields are compatible within v1; removals or semantic renames require a schema-version change.
+- Standard output will be machine-readable JSON when `--json` is selected.
+- Diagnostics will belong on standard error.
+- Additive fields will be compatible within v1; removals or semantic renames will require a schema-version change.
 - `run-with-timeout` is reserved for the later process-supervisor work and must not be improvised in the foundation CLI.
 
 See GitHub #40 and the planned `docs/json-contract.md` for the complete contract.
