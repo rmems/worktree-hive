@@ -57,7 +57,7 @@ Prerequisites:
 - Git
 - GitHub CLI for future GitHub operations
 
-The workspace MSRV is Rust **1.97**. `rust-toolchain.toml` selects the latest stable toolchain for development and CI.
+The workspace MSRV is Rust **1.97**. `rust-toolchain.toml` pins development and CI to the stable Rust 1.97 toolchain.
 
 ```bash
 cargo build --workspace
