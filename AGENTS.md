@@ -66,6 +66,12 @@ bd close <id>         # Complete work
 
 ## Hybrid architecture
 
+worktrees-hives is a **Python/Rust hybrid** designed so that each layer owns what it does best:
+
+- **Rust** — performance, memory discipline, git worktrees, process supervision/timeouts, job state, and **hard safety enforcement** (never-merge, force-with-lease only, branch verification, path sandboxing).
+- **Python** — orchestration policy, discover/partition, issue-to-PR and babysit loops, human reports, and agent glue.
+- **Agent skill (`SKILL.md`)** — portable prompts describing when and how agents call the CLI on any platform.
+
 ```text
 Agent / SKILL.md
        |
@@ -88,6 +94,8 @@ git / gh / operating system
 | Python orchestrator | Discover and partition work, enforce owner and per-cycle policy, order stacks, drive issue-to-PR and babysit loops, and build human-readable reports. |
 | Rust core and CLI | Resolve sandboxed paths, create and remove worktrees, persist atomic job state, supervise child processes, verify branches, and reject unsafe git/GitHub operations. |
 | External tools | `git` and `gh` perform only operations selected and validated by Rust. The OS supplies filesystem and process primitives. |
+
+**Why this split?** Rust enforces safety-sensitive mutation rules at the binary boundary so a malformed prompt or Python bug cannot bypass them. Python handles orchestration logic that benefits from rapid iteration and rich ecosystem tooling. The agent skill layer remains portable across platforms without coupling to either runtime.
 
 The stable cross-language boundary is a CLI with JSON envelopes. PyO3 is out of scope for v1. The contract is versioned independently so Python and Rust can evolve without sharing an in-process ABI.
 
