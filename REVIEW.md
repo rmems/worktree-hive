@@ -100,7 +100,7 @@ Skill text is a portable operator interface, not enforcement. Verify that it:
 Post a fix reply only after its commit is pushed. Include the short or full SHA and attribution, for example:
 
 ```text
-Grok Build agent: fixed the branch check in abc1234 and added the mismatch regression test.
+Worker agent: fixed the branch check in abc1234 and added the mismatch regression test.
 ```
 
 Replies may explain why no code change is needed and do not count against the code-fix budget. Resolve a thread only when the concern is addressed or the reviewer has accepted the explanation.
