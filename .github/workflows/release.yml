@@ -19,8 +19,30 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  check-python-pkg:
+    name: check Python package exists
+    runs-on: ubuntu-latest
+    outputs:
+      exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Check for python/Cargo.toml
+        id: check
+        run: |
+          if [ -f "python/Cargo.toml" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::python/Cargo.toml not found; skipping Python release steps."
+          fi
+
   build-wheels:
     name: wheel (${{ matrix.target }})
+    needs: [check-python-pkg]
+    if: needs.check-python-pkg.outputs.exists == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -61,6 +83,8 @@ jobs:
 
   build-sdist:
     name: source distribution
+    needs: [check-python-pkg]
+    if: needs.check-python-pkg.outputs.exists == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
