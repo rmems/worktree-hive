@@ -1,0 +1,42 @@
+"""Custom exceptions for worktrees-hives subprocess bridge."""
+
+from __future__ import annotations
+
+
+class WhError(Exception):
+    """Base exception for all wh CLI errors."""
+
+
+class WhBinaryNotFoundError(WhError):
+    """Raised when the wh binary cannot be located on PATH or WH_BIN."""
+
+    def __init__(self, detail: str | None = None) -> None:
+        msg = detail or (
+            "wh binary not found. Install wh (cargo install --path crates/wh) "
+            "or set WH_BIN to the full path."
+        )
+        super().__init__(msg)
+
+
+class WhProcessError(WhError):
+    """Raised when wh exits with a non-zero status code."""
+
+    def __init__(self, returncode: int, stderr: str) -> None:
+        self.returncode = returncode
+        self.stderr = stderr
+        super().__init__(f"wh exited with code {returncode}: {stderr}")
+
+
+class WhJsonDecodeError(WhError):
+    """Raised when wh output is not valid JSON."""
+
+    def __init__(self, raw: str, cause: Exception | None = None) -> None:
+        self.raw = raw
+        super().__init__(f"Failed to decode wh JSON output: {cause}")
+
+
+class WhSchemaError(WhError):
+    """Raised when the wh response envelope does not match the v1 schema."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(f"Invalid v1 envelope: {detail}")
