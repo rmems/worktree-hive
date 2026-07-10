@@ -1,0 +1,15 @@
+[package]
+name = "wh"
+description = "Command-line interface for worktrees-hives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+wh-core = { path = "../wh-core" }
+
+[lints]
+workspace = true
