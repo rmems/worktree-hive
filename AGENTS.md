@@ -141,12 +141,12 @@ Use platform-aware user-data resolution in implementation. For example, prefer t
 
 ## JSON and process boundary
 
-**Status: Planned / not yet implemented.** The features below are documented requirements for the v1 contract (GitHub #40).
+**Status: Partially implemented.** `wh --json` now emits the scaffold v1 success envelope on standard output. The full command set, request types, and broader contract surface remain tracked in GitHub #40.
 
 Version 1 responses will use this envelope shape:
 
 ```json
-{"ok":true,"schema_version":1,"command":"state.show","data":{},"error":null}
+{"ok":true,"schema_version":1,"command":"cli.bootstrap","data":{},"error":null}
 ```
 
 - Standard output will be machine-readable JSON when `--json` is selected.
