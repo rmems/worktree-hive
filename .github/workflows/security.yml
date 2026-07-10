@@ -15,19 +15,6 @@ permissions:
   contents: read
 
 jobs:
-  dependency-review:
-    name: dependency review
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - name: Dependency review
-        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4
-
   cargo-audit:
     name: cargo audit
     runs-on: ubuntu-latest

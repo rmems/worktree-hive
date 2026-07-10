@@ -21,8 +21,30 @@ permissions:
   contents: read
 
 jobs:
+  check-python-pkg:
+    name: check Python package exists
+    runs-on: ubuntu-latest
+    outputs:
+      exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Check for python/ directory
+        id: check
+        run: |
+          if [ -d "python" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::python/ directory not found; skipping Python CI."
+          fi
+
   lint:
     name: ruff + mypy
+    needs: [check-python-pkg]
+    if: needs.check-python-pkg.outputs.exists == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -51,7 +73,8 @@ jobs:
 
   test:
     name: test (Python ${{ matrix.python-version }})
-    needs: lint
+    needs: [check-python-pkg, lint]
+    if: needs.check-python-pkg.outputs.exists == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -89,7 +112,8 @@ jobs:
 
   build-wheels:
     name: wheel (${{ matrix.target }})
-    needs: test
+    needs: [check-python-pkg, test]
+    if: needs.check-python-pkg.outputs.exists == 'true'
     strategy:
       fail-fast: false
       matrix:
