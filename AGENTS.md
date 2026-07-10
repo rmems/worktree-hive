@@ -132,12 +132,12 @@ GitHub is the product issue source. Linear team `rmems` (`RM`) mirrors product p
 
 | Purpose | Default | Override |
 | --- | --- | --- |
-| Worktree root | `~/.local/share/worktrees-hives/worktrees` | `WH_WORKTREE_BASE` |
+| Worktree root | User data directory plus `worktrees-hives/worktrees` | `WH_WORKTREE_BASE` |
 | Job worktree | `{worktree root}/{owner}/{repo}/{job_id}` | Derived only; must remain sandboxed |
-| Watched state | `~/.local/share/worktrees-hives/watched.json` | `WH_STATE_PATH` |
+| Watched state | User data directory plus `worktrees-hives/watched.json` | `WH_STATE_PATH` |
 | Rust binary used by Python | `wh` from `PATH` | `WH_BIN` |
 
-Use platform-aware XDG/user-data resolution in implementation. Never assume a Linux-only home-directory layout when an OS API is available.
+Use platform-aware user-data resolution in implementation. For example, prefer the platform default application-data location such as `~/.local/share` on Linux, `~/Library/Application Support` on macOS, or `%APPDATA%` on Windows rather than assuming a Linux-only home-directory layout.
 
 ## JSON and process boundary
 
