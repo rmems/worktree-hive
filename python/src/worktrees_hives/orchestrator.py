@@ -85,12 +85,24 @@ class Orchestrator:
         self._concurrency = concurrency
         self._default_timeout = default_timeout
 
-    async def run(self, workers: list[WorkerSpec]) -> OrchestratorReport:
+    async def run(
+        self,
+        workers: list[WorkerSpec],
+        on_status_change: Callable[[str, WorkerStatus], None] | None = None,
+    ) -> OrchestratorReport:
         """Execute all workers and return an aggregated report.
 
         Workers are dispatched subject to the concurrency cap.  Each worker
         is wrapped with timeout and error-handling logic so that one failure
         never cancels siblings.
+
+        Parameters
+        ----------
+        on_status_change:
+            Optional callback invoked on every worker state transition.
+            Called with ``(worker_id, new_status)`` as each worker moves
+            through PENDING → RUNNING → <terminal>.  The callback is invoked
+            from within the running event loop and must not block.
         """
         if not workers:
             return OrchestratorReport(
@@ -107,7 +119,7 @@ class Orchestrator:
         start = time.monotonic()
 
         async def _run_one(spec: WorkerSpec) -> WorkerResult:
-            return await self._execute_worker(spec, semaphore)
+            return await self._execute_worker(spec, semaphore, on_status_change)
 
         results = await asyncio.gather(
             *(_run_one(w) for w in workers),
@@ -121,15 +133,24 @@ class Orchestrator:
         self,
         spec: WorkerSpec,
         semaphore: asyncio.Semaphore,
+        on_status_change: Callable[[str, WorkerStatus], None] | None = None,
     ) -> WorkerResult:
         """Run a single worker under the semaphore with timeout handling."""
         timeout = spec.timeout if spec.timeout is not None else self._default_timeout
-        start = time.monotonic()
+
+        def _notify(status: WorkerStatus) -> None:
+            if on_status_change is not None:
+                on_status_change(spec.worker_id, status)
+
+        _notify(WorkerStatus.PENDING)
 
         async with semaphore:
+            start = time.monotonic()
+            _notify(WorkerStatus.RUNNING)
             try:
                 coro = spec.fn(*spec.args, **spec.kwargs)
                 result = await asyncio.wait_for(coro, timeout=timeout)
+                _notify(WorkerStatus.SUCCEEDED)
                 return WorkerResult(
                     worker_id=spec.worker_id,
                     status=WorkerStatus.SUCCEEDED,
@@ -137,6 +158,7 @@ class Orchestrator:
                     elapsed_seconds=time.monotonic() - start,
                 )
             except asyncio.TimeoutError:
+                _notify(WorkerStatus.TIMED_OUT)
                 return WorkerResult(
                     worker_id=spec.worker_id,
                     status=WorkerStatus.TIMED_OUT,
@@ -144,6 +166,7 @@ class Orchestrator:
                     elapsed_seconds=time.monotonic() - start,
                 )
             except asyncio.CancelledError:
+                _notify(WorkerStatus.CANCELLED)
                 return WorkerResult(
                     worker_id=spec.worker_id,
                     status=WorkerStatus.CANCELLED,
@@ -151,6 +174,7 @@ class Orchestrator:
                     elapsed_seconds=time.monotonic() - start,
                 )
             except Exception as exc:
+                _notify(WorkerStatus.FAILED)
                 return WorkerResult(
                     worker_id=spec.worker_id,
                     status=WorkerStatus.FAILED,

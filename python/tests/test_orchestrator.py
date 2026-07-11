@@ -289,3 +289,74 @@ class TestOrchestratorMixed:
         report = await o.run([spec])
         assert report.elapsed_seconds >= 0.01
         assert report.results[0].elapsed_seconds >= 0.01
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator.run — on_status_change callback
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorStatusCallback:
+    @pytest.mark.asyncio
+    async def test_callback_receives_pending_running_terminal(self):
+        transitions: list[tuple[str, WorkerStatus]] = []
+
+        def on_change(worker_id: str, status: WorkerStatus) -> None:
+            transitions.append((worker_id, status))
+
+        o = Orchestrator(concurrency=2)
+        spec = WorkerSpec(worker_id="w1", fn=_ok, args=("hi",))
+        await o.run([spec], on_status_change=on_change)
+
+        statuses = [s for _, s in transitions if _ == "w1"]
+        assert statuses[0] == WorkerStatus.PENDING
+        assert statuses[1] == WorkerStatus.RUNNING
+        assert statuses[2] == WorkerStatus.SUCCEEDED
+
+    @pytest.mark.asyncio
+    async def test_callback_reports_failed_terminal(self):
+        transitions: list[tuple[str, WorkerStatus]] = []
+
+        o = Orchestrator(concurrency=2)
+        spec = WorkerSpec(worker_id="w1", fn=_fail)
+        await o.run([spec], on_status_change=lambda wid, s: transitions.append((wid, s)))
+
+        statuses = [s for _, s in transitions]
+        assert WorkerStatus.PENDING in statuses
+        assert WorkerStatus.RUNNING in statuses
+        assert WorkerStatus.FAILED in statuses
+
+    @pytest.mark.asyncio
+    async def test_callback_reports_timed_out_terminal(self):
+        transitions: list[tuple[str, WorkerStatus]] = []
+
+        o = Orchestrator(concurrency=2, default_timeout=0.05)
+        spec = WorkerSpec(worker_id="w1", fn=_hang)
+        await o.run([spec], on_status_change=lambda wid, s: transitions.append((wid, s)))
+
+        statuses = [s for _, s in transitions]
+        assert WorkerStatus.TIMED_OUT in statuses
+
+    @pytest.mark.asyncio
+    async def test_no_callback_does_not_raise(self):
+        o = Orchestrator(concurrency=2)
+        spec = WorkerSpec(worker_id="w1", fn=_ok)
+        report = await o.run([spec])
+        assert report.succeeded == 1
+
+    @pytest.mark.asyncio
+    async def test_pending_precedes_running_under_contention(self):
+        """Workers queued behind the cap still emit PENDING before RUNNING."""
+        transitions: list[tuple[str, WorkerStatus]] = []
+
+        def on_change(worker_id: str, status: WorkerStatus) -> None:
+            transitions.append((worker_id, status))
+
+        o = Orchestrator(concurrency=1)
+        specs = [WorkerSpec(worker_id=f"w{i}", fn=_ok, kwargs={"delay": 0.01}) for i in range(3)]
+        await o.run(specs, on_status_change=on_change)
+
+        for wid in ("w0", "w1", "w2"):
+            wid_statuses = [s for w, s in transitions if w == wid]
+            assert wid_statuses[0] == WorkerStatus.PENDING
+            assert wid_statuses[1] == WorkerStatus.RUNNING
