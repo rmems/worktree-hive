@@ -32,9 +32,13 @@ Issues = "https://github.com/rmems/worktrees-hives/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/worktrees_hives"]
 
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+asyncio_mode = "auto"
 
 [tool.ruff]
 src = ["src"]

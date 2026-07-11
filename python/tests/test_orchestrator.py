@@ -108,7 +108,6 @@ class TestOrchestratorInit:
 
 
 class TestOrchestratorEmpty:
-    @pytest.mark.asyncio
     async def test_empty_workers(self):
         o = Orchestrator()
         report = await o.run([])
@@ -123,7 +122,6 @@ class TestOrchestratorEmpty:
 
 
 class TestOrchestratorSuccess:
-    @pytest.mark.asyncio
     async def test_single_worker(self):
         o = Orchestrator(concurrency=2)
         spec = WorkerSpec(worker_id="w1", fn=_ok, args=("hello",))
@@ -134,7 +132,6 @@ class TestOrchestratorSuccess:
         assert report.results[0].result == "hello"
         assert report.results[0].status == WorkerStatus.SUCCEEDED
 
-    @pytest.mark.asyncio
     async def test_multiple_workers(self):
         o = Orchestrator(concurrency=2)
         specs = [
@@ -149,7 +146,6 @@ class TestOrchestratorSuccess:
         for i in range(5):
             assert results_by_id[f"w{i}"] == f"r{i}"
 
-    @pytest.mark.asyncio
     async def test_concurrency_cap_observed(self):
         """Verify that no more than `concurrency` workers run simultaneously."""
         max_concurrent = 0
@@ -181,7 +177,6 @@ class TestOrchestratorSuccess:
 
 
 class TestOrchestratorFailure:
-    @pytest.mark.asyncio
     async def test_worker_failure_does_not_cancel_siblings(self):
         o = Orchestrator(concurrency=4)
         specs = [
@@ -197,7 +192,6 @@ class TestOrchestratorFailure:
         assert fail_result.status == WorkerStatus.FAILED
         assert "RuntimeError: bad news" in fail_result.error  # type: ignore[union-attr]
 
-    @pytest.mark.asyncio
     async def test_all_workers_fail(self):
         o = Orchestrator(concurrency=2)
         specs = [
@@ -215,7 +209,6 @@ class TestOrchestratorFailure:
 
 
 class TestOrchestratorTimeout:
-    @pytest.mark.asyncio
     async def test_default_timeout(self):
         o = Orchestrator(concurrency=2, default_timeout=0.05)
         spec = WorkerSpec(worker_id="slow", fn=_hang)
@@ -225,7 +218,6 @@ class TestOrchestratorTimeout:
         assert report.results[0].status == WorkerStatus.TIMED_OUT
         assert "timed out" in report.results[0].error  # type: ignore[union-attr]
 
-    @pytest.mark.asyncio
     async def test_per_worker_timeout(self):
         o = Orchestrator(concurrency=2)
         specs = [
@@ -240,7 +232,6 @@ class TestOrchestratorTimeout:
         assert fast.result == "ok"
         assert slow.status == WorkerStatus.TIMED_OUT
 
-    @pytest.mark.asyncio
     async def test_no_timeout_means_wait(self):
         o = Orchestrator(concurrency=2, default_timeout=None)
         spec = WorkerSpec(worker_id="w1", fn=_ok, args=("done",), kwargs={"delay": 0.01})
@@ -255,7 +246,6 @@ class TestOrchestratorTimeout:
 
 
 class TestOrchestratorMixed:
-    @pytest.mark.asyncio
     async def test_mixed_outcomes(self):
         o = Orchestrator(concurrency=3, default_timeout=0.1)
         specs = [
@@ -270,7 +260,6 @@ class TestOrchestratorMixed:
         assert report.timed_out == 1
         assert report.elapsed_seconds > 0
 
-    @pytest.mark.asyncio
     async def test_worker_receives_kwargs(self):
         async def echo(a: str, b: str = "default") -> str:
             return f"{a}-{b}"
@@ -282,7 +271,6 @@ class TestOrchestratorMixed:
         report = await o.run([spec])
         assert report.results[0].result == "hello-world"
 
-    @pytest.mark.asyncio
     async def test_elapsed_seconds_positive(self):
         o = Orchestrator(concurrency=2)
         spec = WorkerSpec(worker_id="w1", fn=_ok, kwargs={"delay": 0.01})
@@ -297,7 +285,6 @@ class TestOrchestratorMixed:
 
 
 class TestOrchestratorStatusCallback:
-    @pytest.mark.asyncio
     async def test_callback_receives_pending_running_terminal(self):
         transitions: list[tuple[str, WorkerStatus]] = []
 
@@ -313,7 +300,6 @@ class TestOrchestratorStatusCallback:
         assert statuses[1] == WorkerStatus.RUNNING
         assert statuses[2] == WorkerStatus.SUCCEEDED
 
-    @pytest.mark.asyncio
     async def test_callback_reports_failed_terminal(self):
         transitions: list[tuple[str, WorkerStatus]] = []
 
@@ -326,7 +312,6 @@ class TestOrchestratorStatusCallback:
         assert WorkerStatus.RUNNING in statuses
         assert WorkerStatus.FAILED in statuses
 
-    @pytest.mark.asyncio
     async def test_callback_reports_timed_out_terminal(self):
         transitions: list[tuple[str, WorkerStatus]] = []
 
@@ -337,14 +322,12 @@ class TestOrchestratorStatusCallback:
         statuses = [s for _, s in transitions]
         assert WorkerStatus.TIMED_OUT in statuses
 
-    @pytest.mark.asyncio
     async def test_no_callback_does_not_raise(self):
         o = Orchestrator(concurrency=2)
         spec = WorkerSpec(worker_id="w1", fn=_ok)
         report = await o.run([spec])
         assert report.succeeded == 1
 
-    @pytest.mark.asyncio
     async def test_pending_precedes_running_under_contention(self):
         """Workers queued behind the cap still emit PENDING before RUNNING."""
         transitions: list[tuple[str, WorkerStatus]] = []
