@@ -1,0 +1,36 @@
+name: Bug report / unexpected behavior (subagent spawn or worktree sandbox)
+description: Report a bug in subagent spawning, worktree isolation, safety gates, etc.
+
+body:
+- type: markdown
+  attributes:
+    value: |
+      ## 🛡️ Safety-first debug mode — no auto-merge allowed!
+
+      This repo runs agents that spawn isolated git worktrees for issue → PR workflows (never auto merge). Bug reports should focus on agent behavior, not just "it broke" to help subagents understand root cause.
+
+- type: input
+  id: bug-title
+  attributes:
+    label: Bug title or one-line summary? 
+    description: Short name of what went wrong  
+    placeholder: e.g., "Agent spawns PR into wrong branch for #42, worktree isolation fails"  
+
+- type: textarea
+  id: steps-to-repro
+  attributes:
+    label: Steps to reproduce (required) — include agent commands, CLI args, GitHub/Linear issue numbers? 
+    description: |
+      List exactly what the subagent or Python orchestrator did wrong. If it involves CLI tooling (`wh state`, `git-safe push`), specify command output + exit codes too!
+
+- type: textarea
+  attributes:
+    label: Expected behavior / agent policy violation (if applicable)? 
+    description: |  
+      Did the Rust safety gate reject a bad commit? Why did it let that through instead? Was Python's subprocess bridge missing `--json` flag when required for v1 JSON envelopes?  
+
+- type: textarea
+  id: environment-details-rust-python-version-github-action-traces-used-mimocode-or-local-subagent
+  attributes:
+    label: Environment + traces (optional but helpful) — Rust version, Python package versions, GitHub Actions workflow names or local sub-agent spawn logs (like `mimo`)  
+    description: |
