@@ -36,11 +36,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(
-    cli: Cli,
-    jobs: Vec<wh_core::status::JobStatus>,
-    stdout: &mut impl Write,
-) -> io::Result<()> {
+fn run(cli: Cli, jobs: Vec<wh_core::status::JobStatus>, stdout: &mut impl Write) -> io::Result<()> {
     match cli.command {
         Some(cmd) => {
             let command_name = match cmd {
@@ -58,7 +54,11 @@ fn run(
                     writeln!(
                         stdout,
                         "{} [{}] {}/{} branch={} ci={}",
-                        job.job_id, job.process_state, job.owner, job.repo, job.branch,
+                        job.job_id,
+                        job.process_state,
+                        job.owner,
+                        job.repo,
+                        job.branch,
                         job.ci_class
                     )?;
                 }
@@ -152,11 +152,24 @@ mod tests {
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-        assert_eq!(v["schema_version"], 1);
-        assert_eq!(v["command"], "cli.status");
-        assert!(v["ok"].as_bool().unwrap());
-        assert!(v["error"].is_null());
-        assert!(v["data"]["jobs"].as_array().unwrap().is_empty());
+        // Verify top-level envelope keys exist (not just Null from missing keys).
+        assert_eq!(v.get("schema_version").expect("missing schema_version"), 1);
+        assert_eq!(v.get("command").expect("missing command"), "cli.status");
+        assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
+        assert!(
+            v.get("error").expect("missing error").is_null(),
+            "error must be explicitly null, not absent"
+        );
+        // Verify data.jobs is present and empty — not just Null from a missing key.
+        let data = v.get("data").expect("missing data");
+        let jobs = data
+            .get("jobs")
+            .expect("missing data.jobs")
+            .as_array()
+            .expect("data.jobs must be an array");
+        assert!(jobs.is_empty());
+        // Verify jobs does NOT leak to top level.
+        assert!(v.get("jobs").is_none(), "jobs must be nested under data");
     }
 
     #[test]
@@ -172,9 +185,18 @@ mod tests {
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-        assert_eq!(v["data"]["jobs"].as_array().unwrap().len(), 1);
-        assert_eq!(v["data"]["jobs"][0]["job_id"], "wh-1");
-        assert_eq!(v["data"]["jobs"][0]["process_state"], "running");
+        let data = v.get("data").expect("missing data");
+        let jobs = data
+            .get("jobs")
+            .expect("missing data.jobs")
+            .as_array()
+            .expect("data.jobs must be an array");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].get("job_id").expect("missing job_id"), "wh-1");
+        assert_eq!(
+            jobs[0].get("process_state").expect("missing process_state"),
+            "running"
+        );
     }
 
     #[test]
@@ -190,11 +212,21 @@ mod tests {
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-        assert_eq!(v["schema_version"], 1);
-        assert_eq!(v["command"], "cli.jobs");
-        assert!(v["ok"].as_bool().unwrap());
-        assert!(v["error"].is_null());
-        assert!(v["data"]["jobs"].as_array().unwrap().is_empty());
+        assert_eq!(v.get("schema_version").expect("missing schema_version"), 1);
+        assert_eq!(v.get("command").expect("missing command"), "cli.jobs");
+        assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
+        assert!(
+            v.get("error").expect("missing error").is_null(),
+            "error must be explicitly null, not absent"
+        );
+        let data = v.get("data").expect("missing data");
+        let jobs = data
+            .get("jobs")
+            .expect("missing data.jobs")
+            .as_array()
+            .expect("data.jobs must be an array");
+        assert!(jobs.is_empty());
+        assert!(v.get("jobs").is_none(), "jobs must be nested under data");
     }
 
     #[test]

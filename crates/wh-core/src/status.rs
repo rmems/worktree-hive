@@ -132,13 +132,18 @@ mod tests {
         let json = serde_json::to_string(&job).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(v["job_id"], "wh-100");
-        assert_eq!(v["process_state"], "running");
-        assert_eq!(v["ci_class"], "pending");
-        assert_eq!(v["issue_number"], 29);
-        assert_eq!(v["pr_number"], 42);
-        assert!(v.get("last_error").is_some());
-        assert_eq!(v["last_error"], "task failed: permission denied");
+        assert_eq!(v.get("job_id").expect("missing job_id"), "wh-100");
+        assert_eq!(
+            v.get("process_state").expect("missing process_state"),
+            "running"
+        );
+        assert_eq!(v.get("ci_class").expect("missing ci_class"), "pending");
+        assert_eq!(v.get("issue_number").expect("missing issue_number"), 29);
+        assert_eq!(v.get("pr_number").expect("missing pr_number"), 42);
+        assert_eq!(
+            v.get("last_error").expect("missing last_error"),
+            "task failed: permission denied"
+        );
     }
 
     #[test]
@@ -163,11 +168,26 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(v["schema_version"], SCHEMA_VERSION);
-        assert_eq!(v["command"], "cli.status");
-        assert!(v["ok"].as_bool().unwrap());
-        assert!(v["error"].is_null());
-        assert_eq!(v["data"]["jobs"].as_array().unwrap().len(), 1);
+        // Verify envelope keys exist (not Null from missing keys).
+        assert_eq!(
+            v.get("schema_version").expect("missing schema_version"),
+            SCHEMA_VERSION
+        );
+        assert_eq!(v.get("command").expect("missing command"), "cli.status");
+        assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
+        assert!(
+            v.get("error").expect("missing error").is_null(),
+            "error must be explicitly null, not absent"
+        );
+        // Verify jobs live under data, not at top level.
+        assert!(v.get("jobs").is_none(), "jobs must not be at top level");
+        let data = v.get("data").expect("missing data");
+        let jobs = data
+            .get("jobs")
+            .expect("missing data.jobs")
+            .as_array()
+            .expect("data.jobs must be an array");
+        assert_eq!(jobs.len(), 1);
     }
 
     #[test]
@@ -183,9 +203,19 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(v["command"], "cli.status");
-        assert_eq!(v["data"]["jobs"][0]["job_id"], "wh-100");
-        assert_eq!(v["data"]["jobs"][0]["branch"], "feature/status-json-cli");
+        assert_eq!(v.get("command").expect("missing command"), "cli.status");
+        let data = v.get("data").expect("missing data");
+        let jobs = data
+            .get("jobs")
+            .expect("missing data.jobs")
+            .as_array()
+            .expect("data.jobs must be an array");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].get("job_id").expect("missing job_id"), "wh-100");
+        assert_eq!(
+            jobs[0].get("branch").expect("missing branch"),
+            "feature/status-json-cli"
+        );
     }
 
     #[test]
