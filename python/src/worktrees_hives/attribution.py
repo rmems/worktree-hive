@@ -26,7 +26,7 @@ class AttributionConfig:
 
     Attributes:
         agent_id: Identity line on replies (e.g. "worktrees-hives agent",
-                  "Claude Code agent: worktrees-hives").
+                  "Claude Code: worktrees-hives agent").
         include_sha_on_fix: Whether to attach commit SHA after code fixes.
         placement: Where the attribution line appears (footer or header).
     """
@@ -46,7 +46,7 @@ class AttributionConfig:
         Returns:
             AttributionConfig with platform-specific agent_id.
         """
-        agent_id = f"{platform} agent: worktrees-hives"
+        agent_id = f"{platform}: worktrees-hives agent"
         return cls(agent_id=agent_id, **kwargs)  # type: ignore[arg-type]
 
 

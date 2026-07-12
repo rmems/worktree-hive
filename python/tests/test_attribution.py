@@ -35,7 +35,7 @@ class TestAttributionConfig:
 
     def test_for_platform(self) -> None:
         config = AttributionConfig.for_platform("Claude Code")
-        assert config.agent_id == "Claude Code agent: worktrees-hives"
+        assert config.agent_id == "Claude Code: worktrees-hives agent"
         assert config.include_sha_on_fix is True
         assert config.placement == AttributionPlacement.FOOTER
 
@@ -45,7 +45,7 @@ class TestAttributionConfig:
             include_sha_on_fix=False,
             placement=AttributionPlacement.HEADER,
         )
-        assert config.agent_id == "Codex agent: worktrees-hives"
+        assert config.agent_id == "Codex: worktrees-hives agent"
         assert config.include_sha_on_fix is False
         assert config.placement == AttributionPlacement.HEADER
 
@@ -170,7 +170,7 @@ class TestFormatReply:
             commit_sha="def5678",
             is_thread_reply=True,
         )
-        expected = "Resolved thread.\n---\nClaude Code agent: worktrees-hives: fixed in def5678"
+        expected = "Resolved thread.\n---\nClaude Code: worktrees-hives agent: fixed in def5678"
         assert result == expected
 
     def test_no_sha_when_disabled(self) -> None:
