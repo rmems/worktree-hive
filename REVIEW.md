@@ -82,6 +82,7 @@ Run:
 
 ```bash
 cd python
+python -m pip install -e '.[test]'
 pytest
 ```
 
