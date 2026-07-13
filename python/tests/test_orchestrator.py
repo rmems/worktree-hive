@@ -14,7 +14,6 @@ from worktrees_hives.orchestrator import (
     WorkerStatus,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -45,7 +44,6 @@ class TestWorkerStatus:
         assert WorkerStatus.SUCCEEDED.value == "succeeded"
         assert WorkerStatus.FAILED.value == "failed"
         assert WorkerStatus.TIMED_OUT.value == "timed_out"
-        assert WorkerStatus.CANCELLED.value == "cancelled"
 
 
 class TestWorkerResult:
@@ -70,16 +68,29 @@ class TestOrchestratorReport:
     def test_all_succeeded_true(self):
         report = OrchestratorReport(
             total=3, succeeded=3, failed=0, timed_out=0,
-            cancelled=0, elapsed_seconds=0.1, results=[],
+            elapsed_seconds=0.1, results=[],
         )
         assert report.all_succeeded is True
 
     def test_all_succeeded_false(self):
         report = OrchestratorReport(
             total=3, succeeded=2, failed=1, timed_out=0,
-            cancelled=0, elapsed_seconds=0.1, results=[],
+            elapsed_seconds=0.1, results=[],
         )
         assert report.all_succeeded is False
+
+    def test_results_are_tuple(self):
+        report = OrchestratorReport(
+            total=1,
+            succeeded=1,
+            failed=0,
+            timed_out=0,
+            elapsed_seconds=0.1,
+            results=[WorkerResult(worker_id="w1", status=WorkerStatus.SUCCEEDED)],
+        )
+        assert isinstance(report.results, tuple)
+        with pytest.raises(AttributeError):
+            report.results.append(WorkerResult("w2", WorkerStatus.SUCCEEDED))  # type: ignore[union-attr]
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +250,36 @@ class TestOrchestratorTimeout:
         assert report.succeeded == 1
         assert report.results[0].result == "done"
 
+    async def test_per_worker_timeout_opt_out(self):
+        """A worker with timeout=None ignores the orchestrator default."""
+        o = Orchestrator(concurrency=2, default_timeout=0.05)
+        spec = WorkerSpec(
+            worker_id="w1",
+            fn=_ok,
+            kwargs={"delay": 0.1},
+            timeout=None,
+        )
+        report = await o.run([spec])
+        assert report.succeeded == 1
+        assert report.results[0].status == WorkerStatus.SUCCEEDED
+
+    async def test_worker_raised_timeout_error_is_failed(self):
+        """A worker that raises asyncio.TimeoutError is reported as FAILED."""
+        async def raise_timeout() -> None:
+            raise asyncio.TimeoutError("boom")
+
+        o = Orchestrator(concurrency=2, default_timeout=None)
+        spec = WorkerSpec(worker_id="w1", fn=raise_timeout)
+        report = await o.run([spec])
+        assert report.total == 1
+        assert report.succeeded == 0
+        assert report.failed == 1
+        assert report.timed_out == 0
+        result = report.results[0]
+        assert result.status == WorkerStatus.FAILED
+        assert "TimeoutError" in result.error
+        assert "boom" in result.error
+
 
 # ---------------------------------------------------------------------------
 # Orchestrator.run — mixed scenarios
@@ -343,3 +384,17 @@ class TestOrchestratorStatusCallback:
             wid_statuses = [s for w, s in transitions if w == wid]
             assert wid_statuses[0] == WorkerStatus.PENDING
             assert wid_statuses[1] == WorkerStatus.RUNNING
+
+    async def test_callback_failure_does_not_rewrite_worker_outcome(self):
+        """A failing status callback is isolated and does not flip SUCCEEDED to FAILED."""
+        def on_change(worker_id: str, status: WorkerStatus) -> None:
+            if status == WorkerStatus.SUCCEEDED:
+                raise RuntimeError("sink broken")
+
+        o = Orchestrator(concurrency=2)
+        spec = WorkerSpec(worker_id="w1", fn=_ok)
+        with pytest.warns(RuntimeWarning, match="sink broken"):
+            report = await o.run([spec], on_status_change=on_change)
+
+        assert report.succeeded == 1
+        assert report.results[0].status == WorkerStatus.SUCCEEDED

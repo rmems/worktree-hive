@@ -8,9 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import math
 import time
+import warnings
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Sequence
+    from typing import Any
 
 
 class WorkerStatus(enum.Enum):
@@ -21,7 +27,6 @@ class WorkerStatus(enum.Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     TIMED_OUT = "timed_out"
-    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,24 +48,46 @@ class OrchestratorReport:
     succeeded: int
     failed: int
     timed_out: int
-    cancelled: int
     elapsed_seconds: float
-    results: list[WorkerResult]
+    results: Sequence[WorkerResult]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "results", tuple(self.results))
 
     @property
     def all_succeeded(self) -> bool:
         return self.succeeded == self.total
 
 
+# Sentinel value for "inherit the orchestrator's default timeout".
+_UNSET_TIMEOUT = float("nan")
+
+
 @dataclass
 class WorkerSpec:
-    """Describes a single worker to be executed."""
+    """Describes a single worker to be executed.
+
+    Parameters
+    ----------
+    timeout:
+        Per-worker timeout in seconds.  ``None`` means no timeout.
+        The default sentinel value means fall back to the orchestrator's
+        ``default_timeout``.
+    """
 
     worker_id: str
     fn: Callable[..., Awaitable[Any]]
     args: tuple[Any, ...] = ()
     kwargs: dict[str, Any] = field(default_factory=dict)
-    timeout: float | None = None
+    timeout: float | None = field(default=_UNSET_TIMEOUT)
+
+
+class WorkerTimeoutError(Exception):
+    """Raised when a worker coroutine raises :exc:`asyncio.TimeoutError`."""
+
+    def __init__(self, original: asyncio.TimeoutError) -> None:
+        super().__init__(str(original))
+        self.original = original
 
 
 class Orchestrator:
@@ -72,7 +99,9 @@ class Orchestrator:
         Maximum number of workers running simultaneously.
     default_timeout:
         Per-worker timeout in seconds.  ``None`` means no timeout.
-        Individual ``WorkerSpec.timeout`` values override this.
+        Individual ``WorkerSpec.timeout`` values override this; set a
+        worker's ``timeout`` to ``None`` to disable the timeout for that
+        worker even when a default is configured.
     """
 
     def __init__(
@@ -110,7 +139,6 @@ class Orchestrator:
                 succeeded=0,
                 failed=0,
                 timed_out=0,
-                cancelled=0,
                 elapsed_seconds=0.0,
                 results=[],
             )
@@ -136,11 +164,20 @@ class Orchestrator:
         on_status_change: Callable[[str, WorkerStatus], None] | None = None,
     ) -> WorkerResult:
         """Run a single worker under the semaphore with timeout handling."""
-        timeout = spec.timeout if spec.timeout is not None else self._default_timeout
+        timeout = self._resolve_timeout(spec)
 
         def _notify(status: WorkerStatus) -> None:
-            if on_status_change is not None:
+            if on_status_change is None:
+                return
+            try:
                 on_status_change(spec.worker_id, status)
+            except Exception as exc:
+                warnings.warn(
+                    f"on_status_change callback failed for {spec.worker_id} "
+                    f"({status.value}): {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         _notify(WorkerStatus.PENDING)
 
@@ -149,7 +186,9 @@ class Orchestrator:
             _notify(WorkerStatus.RUNNING)
             try:
                 coro = spec.fn(*spec.args, **spec.kwargs)
-                result = await asyncio.wait_for(coro, timeout=timeout)
+                result = await asyncio.wait_for(
+                    self._run_coro(coro), timeout=timeout
+                )
                 _notify(WorkerStatus.SUCCEEDED)
                 return WorkerResult(
                     worker_id=spec.worker_id,
@@ -165,12 +204,12 @@ class Orchestrator:
                     error=f"Worker timed out after {timeout}s",
                     elapsed_seconds=time.monotonic() - start,
                 )
-            except asyncio.CancelledError:
-                _notify(WorkerStatus.CANCELLED)
+            except WorkerTimeoutError as exc:
+                _notify(WorkerStatus.FAILED)
                 return WorkerResult(
                     worker_id=spec.worker_id,
-                    status=WorkerStatus.CANCELLED,
-                    error="Worker was cancelled",
+                    status=WorkerStatus.FAILED,
+                    error=f"{type(exc.original).__name__}: {exc.original}",
                     elapsed_seconds=time.monotonic() - start,
                 )
             except Exception as exc:
@@ -182,6 +221,26 @@ class Orchestrator:
                     elapsed_seconds=time.monotonic() - start,
                 )
 
+    def _resolve_timeout(self, spec: WorkerSpec) -> float | None:
+        """Return the effective timeout for a worker.
+
+        ``None`` means no timeout.  The default sentinel means fall back to
+        the orchestrator's ``default_timeout``.
+        """
+        if spec.timeout is None:
+            return None
+        if math.isnan(spec.timeout):
+            return self._default_timeout
+        return spec.timeout
+
+    @staticmethod
+    async def _run_coro(coro: Awaitable[Any]) -> Any:
+        """Run a worker coroutine, converting TimeoutError to a typed exception."""
+        try:
+            return await coro
+        except asyncio.TimeoutError as exc:
+            raise WorkerTimeoutError(exc) from exc
+
     @staticmethod
     def _build_report(
         results: list[WorkerResult],
@@ -191,13 +250,11 @@ class Orchestrator:
         succeeded = sum(1 for r in results if r.status == WorkerStatus.SUCCEEDED)
         failed = sum(1 for r in results if r.status == WorkerStatus.FAILED)
         timed_out = sum(1 for r in results if r.status == WorkerStatus.TIMED_OUT)
-        cancelled = sum(1 for r in results if r.status == WorkerStatus.CANCELLED)
         return OrchestratorReport(
             total=len(results),
             succeeded=succeeded,
             failed=failed,
             timed_out=timed_out,
-            cancelled=cancelled,
             elapsed_seconds=elapsed,
             results=results,
         )
