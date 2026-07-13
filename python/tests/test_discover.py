@@ -133,7 +133,9 @@ class TestDiscoverIssuesForRepo:
     """Tests for discover_issues_for_repo function."""
 
     @patch("worktrees_hives.discover._run_gh")
-    def test_discover_issues_success(self, mock_run_gh: MagicMock, sample_issue_data: dict) -> None:
+    def test_discover_issues_success(
+        self, mock_run_gh: MagicMock, sample_issue_data: dict
+    ) -> None:
         """Test successful issue discovery."""
         mock_run_gh.return_value = (json.dumps([sample_issue_data]), "", 0)
 
@@ -142,13 +144,20 @@ class TestDiscoverIssuesForRepo:
         assert error is None
         assert len(issues) == 1
         assert issues[0].number == 42
-        mock_run_gh.assert_called_once_with([
-            "issue", "list",
-            "--repo", "rmems/test-repo",
-            "--state", "open",
-            "--json", "number,title,state,labels,milestone,url,assignees,createdAt,updatedAt",
-            "--limit", "100",
-        ])
+        mock_run_gh.assert_called_once_with(
+            [
+                "issue",
+                "list",
+                "--repo",
+                "rmems/test-repo",
+                "--state",
+                "open",
+                "--json",
+                "number,title,state,labels,milestone,url,assignees,createdAt,updatedAt",
+                "--limit",
+                "100",
+            ]
+        )
 
     @patch("worktrees_hives.discover._run_gh")
     def test_discover_issues_repo_not_found(self, mock_run_gh: MagicMock) -> None:
@@ -183,27 +192,40 @@ class TestDiscoverIssuesForRepo:
         assert "Failed to parse JSON" in error
 
     @patch("worktrees_hives.discover._run_gh")
-    def test_discover_issues_with_state_filter(self, mock_run_gh: MagicMock, sample_issue_data: dict) -> None:
+    def test_discover_issues_with_state_filter(
+        self, mock_run_gh: MagicMock, sample_issue_data: dict
+    ) -> None:
         """Test issue discovery with state filter."""
         mock_run_gh.return_value = (json.dumps([sample_issue_data]), "", 0)
 
-        issues, error = discover_issues_for_repo("rmems", "test-repo", IssueState.CLOSED)
+        issues, error = discover_issues_for_repo(
+            "rmems", "test-repo", IssueState.CLOSED
+        )
 
         assert error is None
-        mock_run_gh.assert_called_once_with([
-            "issue", "list",
-            "--repo", "rmems/test-repo",
-            "--state", "closed",
-            "--json", "number,title,state,labels,milestone,url,assignees,createdAt,updatedAt",
-            "--limit", "100",
-        ])
+        mock_run_gh.assert_called_once_with(
+            [
+                "issue",
+                "list",
+                "--repo",
+                "rmems/test-repo",
+                "--state",
+                "closed",
+                "--json",
+                "number,title,state,labels,milestone,url,assignees,createdAt,updatedAt",
+                "--limit",
+                "100",
+            ]
+        )
 
 
 class TestDiscoverPullRequestsForRepo:
     """Tests for discover_pull_requests_for_repo function."""
 
     @patch("worktrees_hives.discover._run_gh")
-    def test_discover_prs_success(self, mock_run_gh: MagicMock, sample_pr_data: dict) -> None:
+    def test_discover_prs_success(
+        self, mock_run_gh: MagicMock, sample_pr_data: dict
+    ) -> None:
         """Test successful PR discovery."""
         mock_run_gh.return_value = (json.dumps([sample_pr_data]), "", 0)
 
@@ -231,7 +253,11 @@ class TestListReposForOwner:
     @patch("worktrees_hives.discover._run_gh")
     def test_list_repos_success(self, mock_run_gh: MagicMock) -> None:
         """Test successful repo listing."""
-        mock_run_gh.return_value = (json.dumps([{"name": "repo1"}, {"name": "repo2"}]), "", 0)
+        mock_run_gh.return_value = (
+            json.dumps([{"name": "repo1"}, {"name": "repo2"}]),
+            "",
+            0,
+        )
 
         repos, error = list_repos_for_owner("rmems")
 
@@ -397,7 +423,9 @@ class TestFilterIssues:
 class TestFormatForOrchestrator:
     """Tests for format_for_orchestrator function."""
 
-    def test_format_for_orchestrator(self, sample_issue: Issue, sample_pr: Issue) -> None:
+    def test_format_for_orchestrator(
+        self, sample_issue: Issue, sample_pr: Issue
+    ) -> None:
         """Test formatting for orchestrator consumption."""
         result = DiscoveryResult(
             issues=[sample_issue, sample_pr],
