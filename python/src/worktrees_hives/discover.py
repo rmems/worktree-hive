@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
@@ -13,7 +13,6 @@ class IssueState(str, Enum):
     """State of a GitHub issue or PR."""
     OPEN = "open"
     CLOSED = "closed"
-    IN_PROGRESS = "in_progress"
 
 
 @dataclass(frozen=True)
@@ -56,6 +55,8 @@ def _run_gh(args: list[str]) -> tuple[str, str, int]:
         return result.stdout, result.stderr, result.returncode
     except FileNotFoundError:
         return "", "gh CLI not found", 1
+    except OSError as e:
+        return "", f"Failed to execute gh command: {e}", 1
     except subprocess.TimeoutExpired:
         return "", "gh command timed out", 1
 
@@ -64,23 +65,26 @@ def _parse_issue(data: dict[str, Any], owner: str, repo: str) -> Issue:
     """Parse a GitHub issue/PR JSON response into an Issue object."""
     labels = [label["name"] for label in data.get("labels", [])]
     milestone_data = data.get("milestone")
-    milestone = milestone_data["title"] if milestone_data else None
+    milestone = milestone_data.get("title") if milestone_data else None
     assignees = [assignee["login"] for assignee in data.get("assignees", [])]
 
-    return Issue(
-        number=data["number"],
-        title=data["title"],
-        state=data["state"].lower(),
-        labels=labels,
-        milestone=milestone,
-        url=data["html_url"],
-        owner=owner,
-        repo=repo,
-        is_pr="pullRequest" in data or data.get("pull_request") is not None,
-        assignees=assignees,
-        created_at=data["createdAt"] if "createdAt" in data else data.get("created_at", ""),
-        updated_at=data["updatedAt"] if "updatedAt" in data else data.get("updated_at", ""),
-    )
+    try:
+        return Issue(
+            number=data["number"],
+            title=data["title"],
+            state=data["state"].lower(),
+            labels=labels,
+            milestone=milestone,
+            url=data.get("url", data.get("html_url", "")),
+            owner=owner,
+            repo=repo,
+            is_pr="pullRequest" in data or data.get("pull_request") is not None,
+            assignees=assignees,
+            created_at=data["createdAt"] if "createdAt" in data else data.get("created_at", ""),
+            updated_at=data["updatedAt"] if "updatedAt" in data else data.get("updated_at", ""),
+        )
+    except KeyError as e:
+        raise ValueError(f"Missing required field in issue data: {e}") from e
 
 
 def discover_issues_for_repo(
@@ -157,20 +161,7 @@ def discover_pull_requests_for_repo(
         for item in data:
             issue = _parse_issue(item, owner, repo)
             # PRs are always marked as PRs
-            issues.append(Issue(
-                number=issue.number,
-                title=issue.title,
-                state=issue.state,
-                labels=issue.labels,
-                milestone=issue.milestone,
-                url=issue.url,
-                owner=issue.owner,
-                repo=issue.repo,
-                is_pr=True,
-                assignees=issue.assignees,
-                created_at=issue.created_at,
-                updated_at=issue.updated_at,
-            ))
+            issues.append(replace(issue, is_pr=True))
         return issues, None
     except json.JSONDecodeError as e:
         return [], f"Failed to parse JSON for PRs in {owner}/{repo}: {e}"
@@ -198,7 +189,11 @@ def list_repos_for_owner(owner: str) -> tuple[list[str], str | None]:
 
     try:
         data = json.loads(stdout)
-        repos = [item["name"] for item in data]
+        repos = []
+        for item in data:
+            if "name" not in item:
+                continue  # Skip malformed items
+            repos.append(item["name"])
         return repos, None
     except json.JSONDecodeError as e:
         return [], f"Failed to parse JSON for repos of {owner}: {e}"
