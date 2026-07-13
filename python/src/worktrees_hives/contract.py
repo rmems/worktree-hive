@@ -80,9 +80,7 @@ class Response:
             code = error_raw.get("code")
             message = error_raw.get("message")
             if not isinstance(code, str) or not isinstance(message, str):
-                raise WhSchemaError(
-                    "'error.code' and 'error.message' must be strings"
-                )
+                raise WhSchemaError("'error.code' and 'error.message' must be strings")
             error = ErrorData(code=code, message=message)
 
         return cls(
@@ -123,6 +121,7 @@ def classify(response: Response) -> SuccessResponse | ErrorResponse:
     # error must be present when ok=False per the v1 contract.
     if response.error is None:
         from worktrees_hives.errors import WhSchemaError
+
         raise WhSchemaError("'error' is required when 'ok' is false")
     return ErrorResponse(
         command=response.command,

@@ -137,15 +137,11 @@ class TestResponseFromDict:
 
     def test_error_missing_code_raises(self):
         with pytest.raises(WhSchemaError, match=r"'error\.code'"):
-            Response.from_dict(
-                self._valid_envelope(ok=False, error={"message": "x"})
-            )
+            Response.from_dict(self._valid_envelope(ok=False, error={"message": "x"}))
 
     def test_error_missing_message_raises(self):
         with pytest.raises(WhSchemaError, match=r"'error\.code'"):
-            Response.from_dict(
-                self._valid_envelope(ok=False, error={"code": "E001"})
-            )
+            Response.from_dict(self._valid_envelope(ok=False, error={"code": "E001"}))
 
 
 # ---------------------------------------------------------------------------
