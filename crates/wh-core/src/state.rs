@@ -26,13 +26,17 @@ fn state_path() -> PathBuf {
 
 /// Return all currently watched jobs from the persisted store.
 ///
-/// Returns an empty list when the state file does not exist or cannot be
-/// parsed. Persistence write path is implemented by GitHub #26.
-pub fn load_jobs() -> Vec<JobStatus> {
+/// Returns `Ok(vec![])` when the state file does not exist.
+/// Returns `Err` when the file exists but cannot be read or parsed,
+/// so callers can surface the failure instead of silently masking it.
+/// Persistence write path is implemented by GitHub #26.
+pub fn load_jobs() -> Result<Vec<JobStatus>, String> {
     let path = state_path();
     let data = match fs::read_to_string(&path) {
         Ok(d) => d,
-        Err(_) => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("failed to read {}: {}", path.display(), e)),
     };
-    serde_json::from_str(&data).unwrap_or_default()
+    serde_json::from_str(&data)
+        .map_err(|e| format!("failed to parse {}: {}", path.display(), e))
 }

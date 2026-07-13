@@ -25,9 +25,8 @@ enum Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let jobs = wh_core::state::load_jobs();
 
-    match run(cli, jobs, &mut io::stdout()) {
+    match run(cli, &mut io::stdout()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             let _ = writeln!(io::stderr(), "wh: {error}");
@@ -36,33 +35,22 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli, jobs: Vec<wh_core::status::JobStatus>, stdout: &mut impl Write) -> io::Result<()> {
+/// Entry point that loads watched state only for status/jobs subcommands.
+fn run(cli: Cli, stdout: &mut impl Write) -> io::Result<()> {
     match cli.command {
         Some(cmd) => {
             let command_name = match cmd {
                 Command::Status => "cli.status",
                 Command::Jobs => "cli.jobs",
             };
-            if cli.json {
-                let response = wh_core::status::status_response(command_name, jobs);
-                serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
-                stdout.write_all(b"\n")?;
-            } else if jobs.is_empty() {
-                stdout.write_all(b"No watched jobs.\n")?;
-            } else {
-                for job in &jobs {
-                    writeln!(
-                        stdout,
-                        "{} [{}] {}/{} branch={} ci={}",
-                        job.job_id,
-                        job.process_state,
-                        job.owner,
-                        job.repo,
-                        job.branch,
-                        job.ci_class
-                    )?;
+            let jobs = match wh_core::state::load_jobs() {
+                Ok(j) => j,
+                Err(e) => {
+                    let _ = writeln!(io::stderr(), "wh: warning: {e}");
+                    Vec::new()
                 }
-            }
+            };
+            run_with_jobs(cli.json, command_name, jobs, stdout)
         }
         None => {
             if cli.json {
@@ -73,9 +61,38 @@ fn run(cli: Cli, jobs: Vec<wh_core::status::JobStatus>, stdout: &mut impl Write)
                 .map_err(io::Error::other)?;
                 stdout.write_all(b"\n")?;
             }
+            Ok(())
         }
     }
+}
 
+/// Render status/jobs output. Separated from `run` for testability.
+fn run_with_jobs(
+    json: bool,
+    command_name: &'static str,
+    jobs: Vec<wh_core::status::JobStatus>,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    if json {
+        let response = wh_core::status::status_response(command_name, jobs);
+        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+    } else if jobs.is_empty() {
+        stdout.write_all(b"No watched jobs.\n")?;
+    } else {
+        for job in &jobs {
+            writeln!(
+                stdout,
+                "{} [{}] {}/{} branch={} ci={}",
+                job.job_id,
+                job.process_state,
+                job.owner,
+                job.repo,
+                job.branch,
+                job.ci_class
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -85,7 +102,7 @@ mod tests {
     use std::str;
     use wh_core::status::{CiClass, JobStatus, ProcessState};
 
-    use super::{Cli, Command, run};
+    use super::{Cli, run_with_jobs};
 
     fn sample_job() -> JobStatus {
         JobStatus {
@@ -118,7 +135,7 @@ mod tests {
         };
         let mut stdout = Vec::new();
 
-        run(cli, vec![], &mut stdout).unwrap();
+        super::run(cli, &mut stdout).unwrap();
 
         assert_eq!(
             str::from_utf8(&stdout).unwrap(),
@@ -134,25 +151,20 @@ mod tests {
         };
         let mut stdout = Vec::new();
 
-        run(cli, vec![], &mut stdout).unwrap();
+        super::run(cli, &mut stdout).unwrap();
 
         assert!(stdout.is_empty());
     }
 
     #[test]
     fn status_json_emits_v1_envelope_with_jobs_in_data() {
-        let cli = Cli {
-            json: true,
-            command: Some(Command::Status),
-        };
         let mut stdout = Vec::new();
 
-        run(cli, vec![], &mut stdout).unwrap();
+        run_with_jobs(true, "cli.status", vec![], &mut stdout).unwrap();
 
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-        // Verify top-level envelope keys exist (not just Null from missing keys).
         assert_eq!(v.get("schema_version").expect("missing schema_version"), 1);
         assert_eq!(v.get("command").expect("missing command"), "cli.status");
         assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
@@ -160,7 +172,6 @@ mod tests {
             v.get("error").expect("missing error").is_null(),
             "error must be explicitly null, not absent"
         );
-        // Verify data.jobs is present and empty — not just Null from a missing key.
         let data = v.get("data").expect("missing data");
         let jobs = data
             .get("jobs")
@@ -168,19 +179,14 @@ mod tests {
             .as_array()
             .expect("data.jobs must be an array");
         assert!(jobs.is_empty());
-        // Verify jobs does NOT leak to top level.
         assert!(v.get("jobs").is_none(), "jobs must be nested under data");
     }
 
     #[test]
     fn status_json_includes_injected_jobs() {
-        let cli = Cli {
-            json: true,
-            command: Some(Command::Status),
-        };
         let mut stdout = Vec::new();
 
-        run(cli, vec![sample_job()], &mut stdout).unwrap();
+        run_with_jobs(true, "cli.status", vec![sample_job()], &mut stdout).unwrap();
 
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
@@ -201,13 +207,9 @@ mod tests {
 
     #[test]
     fn jobs_json_emits_v1_envelope_with_jobs_in_data() {
-        let cli = Cli {
-            json: true,
-            command: Some(Command::Jobs),
-        };
         let mut stdout = Vec::new();
 
-        run(cli, vec![], &mut stdout).unwrap();
+        run_with_jobs(true, "cli.jobs", vec![], &mut stdout).unwrap();
 
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
@@ -231,39 +233,27 @@ mod tests {
 
     #[test]
     fn status_without_json_prints_human_readable() {
-        let cli = Cli {
-            json: false,
-            command: Some(Command::Status),
-        };
         let mut stdout = Vec::new();
 
-        run(cli, vec![], &mut stdout).unwrap();
+        run_with_jobs(false, "cli.status", vec![], &mut stdout).unwrap();
 
         assert_eq!(str::from_utf8(&stdout).unwrap(), "No watched jobs.\n");
     }
 
     #[test]
     fn jobs_without_json_prints_human_readable() {
-        let cli = Cli {
-            json: false,
-            command: Some(Command::Jobs),
-        };
         let mut stdout = Vec::new();
 
-        run(cli, vec![], &mut stdout).unwrap();
+        run_with_jobs(false, "cli.jobs", vec![], &mut stdout).unwrap();
 
         assert_eq!(str::from_utf8(&stdout).unwrap(), "No watched jobs.\n");
     }
 
     #[test]
     fn status_without_json_lists_jobs_when_present() {
-        let cli = Cli {
-            json: false,
-            command: Some(Command::Status),
-        };
         let mut stdout = Vec::new();
 
-        run(cli, vec![sample_job()], &mut stdout).unwrap();
+        run_with_jobs(false, "cli.status", vec![sample_job()], &mut stdout).unwrap();
 
         let output = str::from_utf8(&stdout).unwrap();
         assert!(output.contains("wh-1"));

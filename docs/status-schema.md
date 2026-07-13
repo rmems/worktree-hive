@@ -4,7 +4,7 @@ This document defines the JSON schema emitted by `wh status --json` and `wh jobs
 
 ## Envelope
 
-All status responses use the shared v1 envelope defined in the [JSON contract](json-contract.md):
+All status responses use the shared v1 envelope defined in the `Response<T>` type (`crates/wh-core/src/contract.rs`):
 
 | Field | Type | Description |
 | --- | --- | --- |
