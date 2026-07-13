@@ -26,7 +26,7 @@ pub enum ProcessState {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CiClass {
-    /// All required checks passed.
+    /// All required CI checks passed.
     Pass,
     /// At least one required check failed.
     Fail,
@@ -94,12 +94,15 @@ pub struct JobsData {
     pub jobs: Vec<JobStatus>,
 }
 
+/// Named envelope type for `wh status --json` / `wh jobs --json` responses.
+pub type StatusReport = Response<JobsData>;
+
 /// Build a successful v1 envelope response for the given command and job list.
 ///
 /// The returned value serializes as `{ ok, schema_version, command, data: { jobs }, error }`,
 /// matching the shared envelope contract defined in [`crate::contract::Response`].
 #[must_use]
-pub fn status_response(command: &'static str, jobs: Vec<JobStatus>) -> Response<JobsData> {
+pub fn status_response(command: &'static str, jobs: Vec<JobStatus>) -> StatusReport {
     Response::success(command, JobsData { jobs })
 }
 
