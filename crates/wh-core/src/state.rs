@@ -37,6 +37,5 @@ pub fn load_jobs() -> Result<Vec<JobStatus>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("failed to read {}: {}", path.display(), e)),
     };
-    serde_json::from_str(&data)
-        .map_err(|e| format!("failed to parse {}: {}", path.display(), e))
+    serde_json::from_str(&data).map_err(|e| format!("failed to parse {}: {}", path.display(), e))
 }

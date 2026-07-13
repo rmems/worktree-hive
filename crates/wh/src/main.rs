@@ -84,12 +84,7 @@ fn run_with_jobs(
             writeln!(
                 stdout,
                 "{} [{}] {}/{} branch={} ci={}",
-                job.job_id,
-                job.process_state,
-                job.owner,
-                job.repo,
-                job.branch,
-                job.ci_class
+                job.job_id, job.process_state, job.owner, job.repo, job.branch, job.ci_class
             )?;
         }
     }
