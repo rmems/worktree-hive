@@ -108,7 +108,7 @@ jobs:
       - name: Run tests
         env:
           WH_BIN: ${{ github.workspace }}/target/release/wh
-        run: pytest python/tests/ -v --tb=short
+        run: python -m pytest python/tests/ -v --tb=short
 
   build-wheels:
     name: wheel (${{ matrix.target }})
