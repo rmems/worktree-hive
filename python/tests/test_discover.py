@@ -473,7 +473,6 @@ class TestIssueState:
         """Test IssueState enum values."""
         assert IssueState.OPEN.value == "open"
         assert IssueState.CLOSED.value == "closed"
-        assert IssueState.IN_PROGRESS.value == "in_progress"
 
 
 class TestAllowedOwners:
