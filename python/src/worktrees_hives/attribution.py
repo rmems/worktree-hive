@@ -19,6 +19,16 @@ class AttributionPlacement(Enum):
     FOOTER = "footer"
     HEADER = "header"
 
+    @classmethod
+    def coerce(cls, value: str | AttributionPlacement) -> AttributionPlacement:
+        """Normalize a string or enum value to AttributionPlacement."""
+        if isinstance(value, AttributionPlacement):
+            return value
+        try:
+            return cls(value)
+        except ValueError:
+            return cls.FOOTER
+
 
 @dataclass(frozen=True)
 class AttributionConfig:
@@ -36,18 +46,28 @@ class AttributionConfig:
     placement: AttributionPlacement = AttributionPlacement.FOOTER
 
     @classmethod
-    def for_platform(cls, platform: str, **kwargs: object) -> AttributionConfig:
+    def for_platform(
+        cls,
+        platform: str,
+        include_sha_on_fix: bool = True,
+        placement: AttributionPlacement = AttributionPlacement.FOOTER,
+    ) -> AttributionConfig:
         """Create config with platform-specific agent_id.
 
         Args:
             platform: Platform name (e.g. "Claude Code", "Codex", "OpenClaw").
-            **kwargs: Additional config overrides.
+            include_sha_on_fix: Whether to attach commit SHA after code fixes.
+            placement: Where the attribution line appears (footer or header).
 
         Returns:
             AttributionConfig with platform-specific agent_id.
         """
         agent_id = f"{platform}: worktrees-hives agent"
-        return cls(agent_id=agent_id, **kwargs)  # type: ignore[arg-type]
+        return cls(
+            agent_id=agent_id,
+            include_sha_on_fix=include_sha_on_fix,
+            placement=placement,
+        )
 
 
 def format_attribution(
@@ -63,7 +83,7 @@ def format_attribution(
     Returns:
         Formatted attribution string.
     """
-    if config.include_sha_on_fix and commit_sha:
+    if commit_sha:
         return f"{config.agent_id}: fixed in {commit_sha}"
     return config.agent_id
 
@@ -95,8 +115,9 @@ class ReplyTemplate:
             commit_sha=self.commit_sha,
         )
         separator = "---\n" if self.is_thread_reply else "\n"
+        placement = AttributionPlacement.coerce(self.attribution_config.placement)
 
-        if self.attribution_config.placement == AttributionPlacement.HEADER:
+        if placement == AttributionPlacement.HEADER:
             return f"{attribution}\n{separator}{self.body}"
         return f"{self.body}\n{separator}{attribution}"
 

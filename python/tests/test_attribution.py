@@ -55,6 +55,22 @@ class TestAttributionConfig:
             config.agent_id = "new"  # type: ignore[misc]
 
 
+class TestAttributionPlacementCoerce:
+    """Tests for AttributionPlacement.coerce."""
+
+    def test_coerce_enum(self) -> None:
+        assert AttributionPlacement.coerce(AttributionPlacement.HEADER) == AttributionPlacement.HEADER
+
+    def test_coerce_string_header(self) -> None:
+        assert AttributionPlacement.coerce("header") == AttributionPlacement.HEADER
+
+    def test_coerce_string_footer(self) -> None:
+        assert AttributionPlacement.coerce("footer") == AttributionPlacement.FOOTER
+
+    def test_coerce_invalid_string(self) -> None:
+        assert AttributionPlacement.coerce("invalid") == AttributionPlacement.FOOTER
+
+
 class TestFormatAttribution:
     """Tests for format_attribution."""
 
@@ -68,10 +84,10 @@ class TestFormatAttribution:
         result = format_attribution(config, commit_sha="abc1234")
         assert result == f"{DEFAULT_AGENT_ID}: fixed in abc1234"
 
-    def test_with_sha_disabled(self) -> None:
+    def test_with_sha_always_included(self) -> None:
         config = AttributionConfig(include_sha_on_fix=False)
         result = format_attribution(config, commit_sha="abc1234")
-        assert result == DEFAULT_AGENT_ID
+        assert result == f"{DEFAULT_AGENT_ID}: fixed in abc1234"
 
     def test_with_sha_none(self) -> None:
         config = AttributionConfig()
@@ -173,7 +189,7 @@ class TestFormatReply:
         expected = "Resolved thread.\n---\nClaude Code: worktrees-hives agent: fixed in def5678"
         assert result == expected
 
-    def test_no_sha_when_disabled(self) -> None:
+    def test_sha_always_included_when_provided(self) -> None:
         config = AttributionConfig(include_sha_on_fix=False)
         result = format_reply("Fixed.", config=config, commit_sha="abc1234")
-        assert result == "Fixed.\n---\nworktrees-hives agent"
+        assert result == "Fixed.\n---\nworktrees-hives agent: fixed in abc1234"
