@@ -42,6 +42,10 @@ def _resolve_wh_binary(explicit_path: str | None = None) -> str:
             raise WhBinaryNotFoundError(
                 f"Explicit wh path does not exist: {explicit_path}"
             )
+        if not os.access(explicit_path, os.X_OK):
+            raise WhBinaryNotFoundError(
+                f"Explicit wh path is not executable: {explicit_path}"
+            )
         return explicit_path
 
     env_path = os.environ.get("WH_BIN")
@@ -49,6 +53,10 @@ def _resolve_wh_binary(explicit_path: str | None = None) -> str:
         if not os.path.isfile(env_path):
             raise WhBinaryNotFoundError(
                 f"WH_BIN points to non-existent file: {env_path}"
+            )
+        if not os.access(env_path, os.X_OK):
+            raise WhBinaryNotFoundError(
+                f"WH_BIN points to non-executable file: {env_path}"
             )
         return env_path
 
@@ -105,7 +113,7 @@ class WhClient:
                 timeout=self._timeout,
                 check=False,
             )
-        except FileNotFoundError as exc:
+        except OSError as exc:
             raise WhBinaryNotFoundError(
                 f"Failed to execute wh at {binary}: {exc}"
             ) from exc

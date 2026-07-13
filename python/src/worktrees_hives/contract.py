@@ -39,22 +39,34 @@ class Response:
             raise WhSchemaError(f"Expected a JSON object, got {type(raw).__name__}")
 
         ok = raw.get("ok")
+        if ok is None:
+            raise WhSchemaError("'ok' is required")
         if not isinstance(ok, bool):
             raise WhSchemaError(f"'ok' must be a bool, got {type(ok).__name__}")
 
         schema_version = raw.get("schema_version")
-        if not isinstance(schema_version, int):
+        if schema_version is None:
+            raise WhSchemaError("'schema_version' is required")
+        if not isinstance(schema_version, int) or isinstance(schema_version, bool):
             raise WhSchemaError(
                 f"'schema_version' must be an int, got {type(schema_version).__name__}"
             )
+        if schema_version != SCHEMA_VERSION:
+            raise WhSchemaError(
+                f"Unsupported schema version: {schema_version} (expected {SCHEMA_VERSION})"
+            )
 
         command = raw.get("command")
+        if command is None:
+            raise WhSchemaError("'command' is required")
         if not isinstance(command, str):
             raise WhSchemaError(
                 f"'command' must be a str, got {type(command).__name__}"
             )
 
         data = raw.get("data")
+        if data is None:
+            raise WhSchemaError("'data' is required")
         if not isinstance(data, dict):
             raise WhSchemaError(f"'data' must be a dict, got {type(data).__name__}")
 
@@ -108,9 +120,12 @@ def classify(response: Response) -> SuccessResponse | ErrorResponse:
             data=response.data,
             schema_version=response.schema_version,
         )
-    # error is guaranteed non-None when ok=False by the contract.
+    # error must be present when ok=False per the v1 contract.
+    if response.error is None:
+        from worktrees_hives.errors import WhSchemaError
+        raise WhSchemaError("'error' is required when 'ok' is false")
     return ErrorResponse(
         command=response.command,
-        error=response.error or ErrorData(code="unknown", message="missing error"),
+        error=response.error,
         schema_version=response.schema_version,
     )

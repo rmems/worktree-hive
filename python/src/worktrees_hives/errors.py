@@ -32,7 +32,8 @@ class WhJsonDecodeError(WhError):
 
     def __init__(self, raw: str, cause: Exception | None = None) -> None:
         self.raw = raw
-        super().__init__(f"Failed to decode wh JSON output: {cause}")
+        suffix = f": {cause}" if cause is not None else ""
+        super().__init__(f"Failed to decode wh JSON output{suffix}")
 
 
 class WhSchemaError(WhError):
