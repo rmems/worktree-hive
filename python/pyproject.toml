@@ -33,6 +33,11 @@ dev = [
     "mypy>=1.10.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/rmems/worktrees-hives"
 Repository = "https://github.com/rmems/worktrees-hives"
