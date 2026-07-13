@@ -187,10 +187,7 @@ class TestFormatReply:
             commit_sha="def5678",
             is_thread_reply=True,
         )
-        expected = (
-            "Resolved thread.\n---\n"
-            "Claude Code: worktrees-hives agent: fixed in def5678"
-        )
+        expected = "Resolved thread.\n---\nClaude Code: worktrees-hives agent: fixed in def5678"
         assert result == expected
 
     def test_sha_always_included_when_provided(self) -> None:
