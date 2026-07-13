@@ -67,15 +67,23 @@ class TestWorkerResult:
 class TestOrchestratorReport:
     def test_all_succeeded_true(self):
         report = OrchestratorReport(
-            total=3, succeeded=3, failed=0, timed_out=0,
-            elapsed_seconds=0.1, results=[],
+            total=3,
+            succeeded=3,
+            failed=0,
+            timed_out=0,
+            elapsed_seconds=0.1,
+            results=[],
         )
         assert report.all_succeeded is True
 
     def test_all_succeeded_false(self):
         report = OrchestratorReport(
-            total=3, succeeded=2, failed=1, timed_out=0,
-            elapsed_seconds=0.1, results=[],
+            total=3,
+            succeeded=2,
+            failed=1,
+            timed_out=0,
+            elapsed_seconds=0.1,
+            results=[],
         )
         assert report.all_succeeded is False
 
@@ -146,8 +154,7 @@ class TestOrchestratorSuccess:
     async def test_multiple_workers(self):
         o = Orchestrator(concurrency=2)
         specs = [
-            WorkerSpec(worker_id=f"w{i}", fn=_ok, args=(f"r{i}",))
-            for i in range(5)
+            WorkerSpec(worker_id=f"w{i}", fn=_ok, args=(f"r{i}",)) for i in range(5)
         ]
         report = await o.run(specs)
         assert report.total == 5
@@ -174,10 +181,7 @@ class TestOrchestratorSuccess:
                 current_concurrent -= 1
 
         o = Orchestrator(concurrency=3)
-        specs = [
-            WorkerSpec(worker_id=f"w{i}", fn=tracked_worker)
-            for i in range(10)
-        ]
+        specs = [WorkerSpec(worker_id=f"w{i}", fn=tracked_worker) for i in range(10)]
         await o.run(specs)
         assert max_concurrent <= 3
 
@@ -205,9 +209,7 @@ class TestOrchestratorFailure:
 
     async def test_all_workers_fail(self):
         o = Orchestrator(concurrency=2)
-        specs = [
-            WorkerSpec(worker_id=f"w{i}", fn=_fail) for i in range(3)
-        ]
+        specs = [WorkerSpec(worker_id=f"w{i}", fn=_fail) for i in range(3)]
         report = await o.run(specs)
         assert report.failed == 3
         assert report.succeeded == 0
@@ -245,7 +247,9 @@ class TestOrchestratorTimeout:
 
     async def test_no_timeout_means_wait(self):
         o = Orchestrator(concurrency=2, default_timeout=None)
-        spec = WorkerSpec(worker_id="w1", fn=_ok, args=("done",), kwargs={"delay": 0.01})
+        spec = WorkerSpec(
+            worker_id="w1", fn=_ok, args=("done",), kwargs={"delay": 0.01}
+        )
         report = await o.run([spec])
         assert report.succeeded == 1
         assert report.results[0].result == "done"
@@ -265,6 +269,7 @@ class TestOrchestratorTimeout:
 
     async def test_worker_raised_timeout_error_is_failed(self):
         """A worker that raises asyncio.TimeoutError is reported as FAILED."""
+
         async def raise_timeout() -> None:
             raise asyncio.TimeoutError("boom")
 
@@ -346,7 +351,9 @@ class TestOrchestratorStatusCallback:
 
         o = Orchestrator(concurrency=2)
         spec = WorkerSpec(worker_id="w1", fn=_fail)
-        await o.run([spec], on_status_change=lambda wid, s: transitions.append((wid, s)))
+        await o.run(
+            [spec], on_status_change=lambda wid, s: transitions.append((wid, s))
+        )
 
         statuses = [s for _, s in transitions]
         assert WorkerStatus.PENDING in statuses
@@ -358,7 +365,9 @@ class TestOrchestratorStatusCallback:
 
         o = Orchestrator(concurrency=2, default_timeout=0.05)
         spec = WorkerSpec(worker_id="w1", fn=_hang)
-        await o.run([spec], on_status_change=lambda wid, s: transitions.append((wid, s)))
+        await o.run(
+            [spec], on_status_change=lambda wid, s: transitions.append((wid, s))
+        )
 
         statuses = [s for _, s in transitions]
         assert WorkerStatus.TIMED_OUT in statuses
@@ -377,7 +386,10 @@ class TestOrchestratorStatusCallback:
             transitions.append((worker_id, status))
 
         o = Orchestrator(concurrency=1)
-        specs = [WorkerSpec(worker_id=f"w{i}", fn=_ok, kwargs={"delay": 0.01}) for i in range(3)]
+        specs = [
+            WorkerSpec(worker_id=f"w{i}", fn=_ok, kwargs={"delay": 0.01})
+            for i in range(3)
+        ]
         await o.run(specs, on_status_change=on_change)
 
         for wid in ("w0", "w1", "w2"):
@@ -387,6 +399,7 @@ class TestOrchestratorStatusCallback:
 
     async def test_callback_failure_does_not_rewrite_worker_outcome(self):
         """A failing status callback is isolated and does not flip SUCCEEDED to FAILED."""
+
         def on_change(worker_id: str, status: WorkerStatus) -> None:
             if status == WorkerStatus.SUCCEEDED:
                 raise RuntimeError("sink broken")

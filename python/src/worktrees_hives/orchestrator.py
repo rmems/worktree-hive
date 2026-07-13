@@ -186,9 +186,7 @@ class Orchestrator:
             _notify(WorkerStatus.RUNNING)
             try:
                 coro = spec.fn(*spec.args, **spec.kwargs)
-                result = await asyncio.wait_for(
-                    self._run_coro(coro), timeout=timeout
-                )
+                result = await asyncio.wait_for(self._run_coro(coro), timeout=timeout)
                 _notify(WorkerStatus.SUCCEEDED)
                 return WorkerResult(
                     worker_id=spec.worker_id,
