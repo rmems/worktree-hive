@@ -118,8 +118,12 @@ class Watchlist:
         jobs_data = data.get("jobs", {})
         self._jobs = {}
         for job_id, job_dict in jobs_data.items():
-            job_dict["status"] = JobStatus(job_dict["status"])
-            self._jobs[job_id] = JobState(**job_dict)
+            try:
+                d = dict(job_dict)
+                d["status"] = JobStatus(d["status"])
+                self._jobs[job_id] = JobState(**d)
+            except (KeyError, ValueError, TypeError):
+                continue  # skip corrupt/incompatible entry
 
     def _save(self) -> None:
         """Save state to disk atomically."""
@@ -140,10 +144,16 @@ class Watchlist:
     ) -> JobState:
         """Add a new job to the watchlist.
 
-        Raises ValueError if job_id already exists or max_fixes is negative.
+        Raises ValueError if job_id already exists, max_fixes is negative,
+        or max_fixes exceeds the safety ceiling (3).
         """
         if max_fixes < 0:
             raise ValueError("max_fixes must be non-negative")
+        if max_fixes > 3:
+            raise ValueError(
+                f"max_fixes ({max_fixes}) exceeds safety ceiling (3). "
+                "Per AGENTS.md, at most 3 code-fix commits per PR per cycle."
+            )
         if job_id in self._jobs:
             raise ValueError(f"Job {job_id!r} already exists in watchlist")
         job = JobState(

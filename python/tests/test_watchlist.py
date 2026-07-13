@@ -29,7 +29,7 @@ class TestAtomicWrite:
         path = tmp_path / "deep" / "nested" / "state.json"
         _atomic_write_json(path, {"test": True})
         assert path.exists()
-        assert json.loads(path.read_text()) == {"test": True}
+        assert json.loads(path.read_text(encoding="utf-8")) == {"test": True}
 
     def test_overwrites_existing(self, tmp_path: Path) -> None:
         path = tmp_path / "state.json"
@@ -58,9 +58,17 @@ class TestWatchlistAdd:
         assert job.max_fixes == 3
 
     def test_add_with_options(self, watchlist: Watchlist) -> None:
-        job = watchlist.add("j1", "rmems", "repo", "br", stack_id="s1", max_fixes=5)
+        job = watchlist.add("j1", "rmems", "repo", "br", stack_id="s1", max_fixes=3)
         assert job.stack_id == "s1"
-        assert job.max_fixes == 5
+        assert job.max_fixes == 3
+
+    def test_add_negative_max_fixes_raises(self, watchlist: Watchlist) -> None:
+        with pytest.raises(ValueError, match="max_fixes"):
+            watchlist.add("j1", "rmems", "repo", "br", max_fixes=-1)
+
+    def test_add_exceeds_safety_ceiling_raises(self, watchlist: Watchlist) -> None:
+        with pytest.raises(ValueError, match="safety ceiling"):
+            watchlist.add("j1", "rmems", "repo", "br", max_fixes=5)
 
     def test_add_duplicate_raises(self, watchlist: Watchlist) -> None:
         watchlist.add("j1", "rmems", "repo", "br")
@@ -71,8 +79,15 @@ class TestWatchlistAdd:
         w1 = Watchlist(state_path)
         w1.add("j1", "rmems", "repo", "br")
         w2 = Watchlist(state_path)
-        assert w2.get("j1") is not None
-        assert w2.get("j1").owner == "rmems"
+        job = w2.get("j1")
+        assert job is not None
+        assert job.owner == "rmems"
+
+    def test_corrupt_json_recovers_empty(self, state_path: Path) -> None:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text("{not valid json", encoding="utf-8")
+        w = Watchlist(state_path)
+        assert w.list_jobs() == []
 
 
 class TestWatchlistRemove:
@@ -203,9 +218,13 @@ class TestWatchlistCheck:
         watchlist.update_status("j4", JobStatus.COMPLETED)
 
         result = watchlist.check()
+        assert len(result["needs_pr"]) == 1
         assert result["needs_pr"][0].job_id == "j1"
+        assert len(result["needs_fix"]) == 1
         assert result["needs_fix"][0].job_id == "j2"
+        assert len(result["blocked"]) == 1
         assert result["blocked"][0].job_id == "j3"
+        assert len(result["done"]) == 1
         assert result["done"][0].job_id == "j4"
 
 
