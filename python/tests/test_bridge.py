@@ -32,6 +32,7 @@ class TestResolveWhBinary:
     def test_explicit_path_takes_priority(self, tmp_path):
         binary = tmp_path / "wh"
         binary.write_text("#!/bin/sh")
+        binary.chmod(0o755)
         result = _resolve_wh_binary(str(binary))
         assert result == str(binary)
 
@@ -42,6 +43,7 @@ class TestResolveWhBinary:
     def test_wh_bin_env_var(self, tmp_path, monkeypatch):
         binary = tmp_path / "wh"
         binary.write_text("#!/bin/sh")
+        binary.chmod(0o755)
         monkeypatch.setenv("WH_BIN", str(binary))
         result = _resolve_wh_binary(None)
         assert result == str(binary)
