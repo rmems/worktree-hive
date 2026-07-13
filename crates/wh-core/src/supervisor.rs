@@ -6,6 +6,7 @@ use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 
 /// Outcome of a supervised process execution.
 #[derive(Debug, Clone, Serialize)]
@@ -43,9 +44,10 @@ pub struct Supervisor {
 impl Supervisor {
     /// Create a new supervisor with the given max-parallel limit.
     pub fn new(max_parallel: usize) -> Self {
+        let permits = max_parallel.max(1);
         Self {
-            max_parallel,
-            semaphore: Semaphore::new(max_parallel),
+            max_parallel: permits,
+            semaphore: Semaphore::new(permits),
         }
     }
 
@@ -94,30 +96,39 @@ impl Supervisor {
 
         let pid = child.id();
 
+        // Start reading pipes concurrently to prevent deadlock when
+        // the child fills the OS pipe buffer before exiting.
+        let mut child_stdout = child.stdout.take();
+        let mut child_stderr = child.stderr.take();
+        let stdout_handle: JoinHandle<Vec<u8>> =
+            tokio::spawn(async move { read_pipe(&mut child_stdout).await });
+        let stderr_handle: JoinHandle<Vec<u8>> =
+            tokio::spawn(async move { read_pipe(&mut child_stderr).await });
+
         if let Some(timeout) = timeout {
             let deadline = tokio::time::sleep(timeout);
             tokio::pin!(deadline);
-
-            let mut child_stdout = child.stdout.take();
-            let mut child_stderr = child.stderr.take();
 
             tokio::select! {
                 biased;
                 _ = &mut deadline => {
                     kill_process_group(pid);
                     let _ = child.kill().await;
+                    // Collect whatever partial output was captured before timeout.
+                    let stdout = stdout_handle.await.unwrap_or_default();
+                    let stderr = stderr_handle.await.unwrap_or_default();
                     let _ = child.wait().await;
                     SupervisedOutput {
                         exit_code: None,
                         timed_out: true,
                         killed: true,
-                        stdout: String::new(),
-                        stderr: String::new(),
+                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
                     }
                 }
                 status = child.wait() => {
-                    let stdout = read_pipe(&mut child_stdout).await;
-                    let stderr = read_pipe(&mut child_stderr).await;
+                    let stdout = stdout_handle.await.unwrap_or_default();
+                    let stderr = stderr_handle.await.unwrap_or_default();
                     match status {
                         Ok(s) => output_to_supervised(s, &stdout, &stderr),
                         Err(e) => SupervisedOutput {
@@ -131,13 +142,10 @@ impl Supervisor {
                 }
             }
         } else {
-            let mut child_stdout = child.stdout.take();
-            let mut child_stderr = child.stderr.take();
-
             match child.wait().await {
                 Ok(status) => {
-                    let stdout = read_pipe(&mut child_stdout).await;
-                    let stderr = read_pipe(&mut child_stderr).await;
+                    let stdout = stdout_handle.await.unwrap_or_default();
+                    let stderr = stderr_handle.await.unwrap_or_default();
                     output_to_supervised(status, &stdout, &stderr)
                 }
                 Err(e) => SupervisedOutput {
@@ -194,12 +202,14 @@ fn output_to_supervised(
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn kill_process_group(pid: Option<u32>) {
     if let Some(pid) = pid {
-        // Send SIGKILL to the process group (negative PID).
-        let _ = std::process::Command::new("kill")
-            .args(["-9", "--", &format!("-{pid}")])
-            .status();
+        // Send SIGKILL to the process group (negative PID) via libc.
+        // SAFETY: kill(2) is async-signal-safe and only sends a signal.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
     }
 }
 
