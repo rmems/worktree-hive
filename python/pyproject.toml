@@ -17,6 +17,9 @@ dev = [
     "mypy>=1.10.0",
 ]
 
+[project.scripts]
+wh = "worktrees_hives.cli:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/worktrees_hives"]
 
