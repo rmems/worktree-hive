@@ -11,6 +11,7 @@ from typing import Any
 
 class IssueState(str, Enum):
     """State of a GitHub issue or PR."""
+
     OPEN = "open"
     CLOSED = "closed"
 
@@ -18,6 +19,7 @@ class IssueState(str, Enum):
 @dataclass(frozen=True)
 class Issue:
     """Represents a GitHub issue or PR."""
+
     number: int
     title: str
     state: str
@@ -35,6 +37,7 @@ class Issue:
 @dataclass(frozen=True)
 class DiscoveryResult:
     """Result of discovering issues across allowed owners."""
+
     issues: list[Issue]
     errors: list[str]
     owners_scanned: list[str]
@@ -80,8 +83,12 @@ def _parse_issue(data: dict[str, Any], owner: str, repo: str) -> Issue:
             repo=repo,
             is_pr="pullRequest" in data or data.get("pull_request") is not None,
             assignees=assignees,
-            created_at=data["createdAt"] if "createdAt" in data else data.get("created_at", ""),
-            updated_at=data["updatedAt"] if "updatedAt" in data else data.get("updated_at", ""),
+            created_at=data["createdAt"]
+            if "createdAt" in data
+            else data.get("created_at", ""),
+            updated_at=data["updatedAt"]
+            if "updatedAt" in data
+            else data.get("updated_at", ""),
         )
     except KeyError as e:
         raise ValueError(f"Missing required field in issue data: {e}") from e
@@ -103,11 +110,16 @@ def discover_issues_for_repo(
         Tuple of (list of issues, error message or None)
     """
     args = [
-        "issue", "list",
-        "--repo", f"{owner}/{repo}",
-        "--state", state.value,
-        "--json", "number,title,state,labels,milestone,url,assignees,createdAt,updatedAt",
-        "--limit", "100",
+        "issue",
+        "list",
+        "--repo",
+        f"{owner}/{repo}",
+        "--state",
+        state.value,
+        "--json",
+        "number,title,state,labels,milestone,url,assignees,createdAt,updatedAt",
+        "--limit",
+        "100",
     ]
 
     stdout, stderr, returncode = _run_gh(args)
@@ -141,11 +153,16 @@ def discover_pull_requests_for_repo(
         Tuple of (list of issues representing PRs, error message or None)
     """
     args = [
-        "pr", "list",
-        "--repo", f"{owner}/{repo}",
-        "--state", state,
-        "--json", "number,title,state,labels,milestone,url,assignees,createdAt,updatedAt",
-        "--limit", "100",
+        "pr",
+        "list",
+        "--repo",
+        f"{owner}/{repo}",
+        "--state",
+        state,
+        "--json",
+        "number,title,state,labels,milestone,url,assignees,createdAt,updatedAt",
+        "--limit",
+        "100",
     ]
 
     stdout, stderr, returncode = _run_gh(args)
@@ -177,9 +194,13 @@ def list_repos_for_owner(owner: str) -> tuple[list[str], str | None]:
         Tuple of (list of repo names, error message or None)
     """
     args = [
-        "repo", "list", owner,
-        "--json", "name",
-        "--limit", "100",
+        "repo",
+        "list",
+        owner,
+        "--json",
+        "name",
+        "--limit",
+        "100",
     ]
 
     stdout, stderr, returncode = _run_gh(args)
@@ -273,27 +294,17 @@ def filter_issues(
 
     if labels:
         result = [
-            issue for issue in result
-            if all(label in issue.labels for label in labels)
+            issue for issue in result if all(label in issue.labels for label in labels)
         ]
 
     if milestone is not None:
-        result = [
-            issue for issue in result
-            if issue.milestone == milestone
-        ]
+        result = [issue for issue in result if issue.milestone == milestone]
 
     if assignee is not None:
-        result = [
-            issue for issue in result
-            if assignee in issue.assignees
-        ]
+        result = [issue for issue in result if assignee in issue.assignees]
 
     if is_pr is not None:
-        result = [
-            issue for issue in result
-            if issue.is_pr == is_pr
-        ]
+        result = [issue for issue in result if issue.is_pr == is_pr]
 
     return result
 
