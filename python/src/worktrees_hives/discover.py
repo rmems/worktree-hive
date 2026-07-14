@@ -386,6 +386,7 @@ def list_repos_for_owner(owner: str) -> tuple[list[str], str | None, bool]:
         "repo",
         "list",
         owner,
+        "--no-archived",
         "--json",
         "name",
         "--limit",

@@ -313,6 +313,9 @@ class TestListReposForOwner:
         assert error is None
         assert repos == ["repo1", "repo2"]
         assert truncated is False
+        # Archived repos are read-only; discovery must skip them.
+        args = mock_run_gh.call_args[0][0]
+        assert "--no-archived" in args
 
     @patch("worktrees_hives.discover._run_gh")
     def test_list_repos_error(self, mock_run_gh: MagicMock) -> None:
