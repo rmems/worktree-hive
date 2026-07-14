@@ -54,15 +54,13 @@ Soft prompt text is not considered enforcement. Hard stops belong in Rust so a m
 
 ## Owner allowlist
 
-By default, discovery and mutation are limited to:
+Repository access is controlled by a **configured owner allowlist**, not a built-in org list.
 
-- `rmems/*`
-- `Limen-Neural/*`
+- Set `WH_ALLOWED_OWNERS=acme,example-org` (comma-separated), and/or
+- Pass explicit `owners=` / `allowed_owners=` in Python APIs.
 
-An explicit user override is required for any other owner (for example via
-`WH_ALLOWED_OWNERS=rmems,Limen-Neural,acme` or Python `owners=` / `allowed_owners=`).
-Authentication should use the least privileges needed by `git` and `gh`; credentials
-must never be written to reports or logs.
+Empty configuration means multi-owner discovery and scheduling do nothing until operators configure scope.
+Examples use generic owners such as `acme` and `example-org`.
 
 
 ## Build and install `wh`
