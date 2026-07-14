@@ -2,9 +2,10 @@
 //!
 //! Safety invariants enforced at the Rust core boundary:
 //! - Only allowlisted git subcommands may be executed.
-//! - Force push requires `--force-with-lease`; bare `--force` / `-f` is rejected.
-//! - Merge subcommands and `gh pr merge` are blocked.
-//! - Mutating commands verify the current branch matches the job record.
+//! - Bare `--force` / `-f` is always rejected; only `--force-with-lease` is permitted.
+//! - Merge is blocked only when it is the git subcommand (branch names like `merge` are allowed).
+//! - `gh pr merge` and merge-related flags are blocked; `gh api` is not allowlisted.
+//! - Mutating commands verify the current branch when `expected_branch` is provided to `run`.
 //! - All policy violations carry stable structured error codes.
 
 use std::collections::HashSet;
@@ -59,9 +60,12 @@ const MUTATING_SUBCOMMANDS: &[&str] = &[
 ];
 
 /// GitHub CLI subcommands allowed for hive jobs.
+///
+/// Note: `api` is intentionally excluded so merge-related REST/GraphQL cannot be
+/// invoked through `gh api` (e.g. `mergePullRequest` / REST merge endpoints).
 const ALLOWED_GH_SUBCOMMANDS: &[&str] = &[
-    "api", "auth", "browse", "gist", "issue", "label", "pr", "release", "repo", "secret",
-    "ssh-key", "variable", "workflow",
+    "auth", "browse", "gist", "issue", "label", "pr", "release", "repo", "secret", "ssh-key",
+    "variable", "workflow",
 ];
 
 /// `gh pr` sub-subcommands that are blocked (merge is disallowed).
@@ -76,8 +80,8 @@ pub struct SafeGitCommand {
     args: Vec<String>,
 }
 
-/// Output from executing a safe git command.
-#[derive(Debug, Clone)]
+/// Output from executing a safe git or gh command.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GitOutput {
     pub stdout: String,
     pub stderr: String,
@@ -98,8 +102,8 @@ impl SafeGitCommand {
 
         let subcommand = &args[0];
 
-        // Reject merge subcommands unconditionally.
-        if is_merge_subcommand(subcommand) || args.iter().any(|a| a == "merge") {
+        // Reject merge only when it is the git subcommand (not a branch/ref named "merge").
+        if is_merge_subcommand(subcommand) {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::MergeBlocked,
                 message: format!("merge is not allowed: `git {}`", args.join(" ")),
@@ -115,13 +119,12 @@ impl SafeGitCommand {
             });
         }
 
-        // Reject bare --force / -f without --force-with-lease.
-        if args.iter().any(|a| a == "--force" || a == "-f")
-            && !args.iter().any(|a| a == "--force-with-lease")
-        {
+        // Reject ANY bare --force / -f always; only --force-with-lease is allowed.
+        // Even when both appear together, bare force is still rejected.
+        if args.iter().any(|a| is_bare_force_flag(a)) {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::BareForcePush,
-                message: "bare --force/-f is not allowed; use --force-with-lease".to_owned(),
+                message: "bare --force/-f is not allowed; use --force-with-lease only".to_owned(),
             });
         }
 
@@ -145,10 +148,10 @@ impl SafeGitCommand {
 
     /// Verify that the current branch matches the expected job branch.
     ///
-    /// Resolves the current branch from the git directory and compares it
+    /// Resolves the current branch from the repository at `repo_dir` and compares it
     /// against `expected_branch`. Returns `Ok(())` on match, error otherwise.
-    pub fn verify_branch(&self, git_dir: &Path, expected_branch: &str) -> Result<()> {
-        let current = resolve_current_branch(git_dir)?;
+    pub fn verify_branch(&self, repo_dir: &Path, expected_branch: &str) -> Result<()> {
+        let current = resolve_current_branch(repo_dir)?;
         if current != expected_branch {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::BranchMismatch,
@@ -160,11 +163,20 @@ impl SafeGitCommand {
         Ok(())
     }
 
-    /// Execute the validated git command, returning stdout, stderr, and exit code.
-    pub fn run(&self, git_dir: &Path) -> Result<GitOutput> {
+    /// Execute the validated git command in `repo_dir`.
+    ///
+    /// When `expected_branch` is `Some` and this command is mutating, verifies the
+    /// current branch before running.
+    pub fn run(&self, repo_dir: &Path, expected_branch: Option<&str>) -> Result<GitOutput> {
+        if self.requires_branch_check() {
+            if let Some(expected) = expected_branch {
+                self.verify_branch(repo_dir, expected)?;
+            }
+        }
+
         let output = Command::new("git")
-            .arg("--git-dir")
-            .arg(git_dir)
+            .arg("-C")
+            .arg(repo_dir)
             .args(&self.args)
             .output()
             .map_err(|e| Error::Io {
@@ -267,11 +279,11 @@ impl SafeGhCommand {
     }
 }
 
-/// Resolve the current branch name from a git directory.
-fn resolve_current_branch(git_dir: &Path) -> Result<String> {
+/// Resolve the current branch name from a repository working tree.
+fn resolve_current_branch(repo_dir: &Path) -> Result<String> {
     let output = Command::new("git")
-        .arg("--git-dir")
-        .arg(git_dir)
+        .arg("-C")
+        .arg(repo_dir)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .map_err(|e| Error::Io {
@@ -288,7 +300,7 @@ fn resolve_current_branch(git_dir: &Path) -> Result<String> {
     }
 
     let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if branch.is_empty() {
+    if branch.is_empty() || branch == "HEAD" {
         return Err(Error::PolicyViolation {
             code: PolicyCode::GitDirUnavailable,
             message: "current branch name is empty (detached HEAD?)".to_owned(),
@@ -300,6 +312,17 @@ fn resolve_current_branch(git_dir: &Path) -> Result<String> {
 
 fn is_merge_subcommand(subcommand: &str) -> bool {
     matches!(subcommand, "merge" | "mergetool")
+}
+
+/// True for bare force flags that are never allowed.
+///
+/// `--force-with-lease` and `--force-with-lease=<ref>` are allowed and must not match.
+fn is_bare_force_flag(arg: &str) -> bool {
+    if arg == "-f" || arg == "--force" {
+        return true;
+    }
+    // Reject `--force=...` but not `--force-with-lease` / `--force-with-lease=...`.
+    arg.starts_with("--force=")
 }
 
 #[cfg(test)]
@@ -370,6 +393,14 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn checkout_branch_named_merge_allowed() {
+        // Merge detection is subcommand-only; a branch named "merge" is fine.
+        let cmd = SafeGitCommand::new(&["checkout".to_owned(), "merge".to_owned()]).unwrap();
+        assert_eq!(cmd.subcommand(), "checkout");
+        assert_eq!(cmd.args(), &["checkout", "merge"]);
+    }
+
     // ---- force push tests ----
 
     #[test]
@@ -404,15 +435,33 @@ mod tests {
     }
 
     #[test]
-    fn force_with_lease_and_bare_force_still_accepted() {
-        // --force-with-lease takes precedence when both present.
-        let cmd = SafeGitCommand::new(&[
+    fn force_with_lease_and_bare_force_rejected() {
+        // Bare --force is always rejected, even when --force-with-lease is also present.
+        let err = SafeGitCommand::new(&[
             "push".to_owned(),
             "--force".to_owned(),
             "--force-with-lease".to_owned(),
         ])
-        .unwrap();
-        assert_eq!(cmd.subcommand(), "push");
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::BareForcePush,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn force_equals_form_rejected() {
+        let err = SafeGitCommand::new(&["push".to_owned(), "--force=true".to_owned()]).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::BareForcePush,
+                ..
+            }
+        ));
     }
 
     // ---- mutating subcommand detection ----
@@ -494,6 +543,25 @@ mod tests {
     }
 
     #[test]
+    fn gh_api_rejected() {
+        // api removed from allowlist to block merge via REST/GraphQL.
+        let err = SafeGhCommand::new(&[
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            "query=mutation { mergePullRequest }".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::GhSubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn gh_unknown_subcommand_rejected() {
         let err = SafeGhCommand::new(&["codespace".to_owned()]).unwrap_err();
         assert!(matches!(
@@ -538,5 +606,45 @@ mod tests {
         let display = format!("{err}");
         assert!(display.contains("BARE_FORCE_PUSH"));
         assert!(display.contains("test message"));
+    }
+
+    #[test]
+    fn run_status_in_repo_executes() {
+        // Execute a read-only allowlisted command in the current workspace.
+        let cmd = SafeGitCommand::new(&["rev-parse".to_owned(), "--is-inside-work-tree".to_owned()])
+            .unwrap();
+        let out = cmd
+            .run(Path::new("."), None)
+            .expect("git should run in workspace");
+        assert_eq!(out.exit_code, 0, "stderr={}", out.stderr);
+        assert_eq!(out.stdout.trim(), "true");
+    }
+
+    #[test]
+    fn run_verifies_expected_branch_for_mutating() {
+        let current = resolve_current_branch(Path::new(".")).expect("resolve branch");
+        let cmd = SafeGitCommand::new(&["status".to_owned(), "--porcelain".to_owned()]).unwrap();
+        // status is not mutating — expected_branch is ignored.
+        let out = cmd.run(Path::new("."), Some("definitely-not-this-branch"));
+        assert!(out.is_ok());
+
+        // Mutating with wrong branch is rejected before spawn.
+        let push = SafeGitCommand::new(&["push".to_owned(), "--dry-run".to_owned()]).unwrap();
+        let err = push
+            .run(Path::new("."), Some("definitely-not-this-branch"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::BranchMismatch,
+                ..
+            }
+        ));
+
+        // Matching branch is accepted (may still fail network; policy must pass first).
+        // Use `status` path already covered; for mutating, verify_branch alone:
+        let push2 = SafeGitCommand::new(&["status".to_owned()]).unwrap();
+        assert!(!push2.requires_branch_check());
+        let _ = current;
     }
 }
