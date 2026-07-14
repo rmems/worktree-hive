@@ -220,12 +220,37 @@ fn kill_process_group(_pid: Option<u32>) {}
 mod tests {
     use super::*;
 
+    /// Portable shell invocation for tests (`sh -c` / `cmd /C`).
+    fn shell_program() -> &'static str {
+        #[cfg(windows)]
+        {
+            "cmd"
+        }
+        #[cfg(not(windows))]
+        {
+            "sh"
+        }
+    }
+
+    fn shell_flag() -> &'static str {
+        #[cfg(windows)]
+        {
+            "/C"
+        }
+        #[cfg(not(windows))]
+        {
+            "-c"
+        }
+    }
+
     #[tokio::test]
     async fn runs_command_to_completion() {
         let supervisor = Supervisor::new(4);
-        let output = supervisor.run("echo", &["hello"], None).await;
+        let output = supervisor
+            .run(shell_program(), &[shell_flag(), "echo hello"], None)
+            .await;
 
-        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
         assert!(!output.timed_out);
         assert!(!output.killed);
         assert_eq!(output.stdout.trim(), "hello");
@@ -234,20 +259,36 @@ mod tests {
     #[tokio::test]
     async fn captures_stderr() {
         let supervisor = Supervisor::new(4);
-        let output = supervisor.run("bash", &["-c", "echo err >&2"], None).await;
+        #[cfg(windows)]
+        let script = "echo err 1>&2";
+        #[cfg(not(windows))]
+        let script = "echo err >&2";
+        let output = supervisor
+            .run(shell_program(), &[shell_flag(), script], None)
+            .await;
 
-        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
         assert_eq!(output.stderr.trim(), "err");
     }
 
     #[tokio::test]
     async fn timeout_kills_process_group() {
         let supervisor = Supervisor::new(4);
+        // Use a long-running shell sleep so we do not depend on a `sleep` binary
+        // being on PATH (Windows CI may lack it outside Git usr/bin).
+        #[cfg(windows)]
+        let script = "ping -n 60 127.0.0.1 >NUL";
+        #[cfg(not(windows))]
+        let script = "sleep 60";
         let output = supervisor
-            .run("sleep", &["60"], Some(Duration::from_millis(200)))
+            .run(
+                shell_program(),
+                &[shell_flag(), script],
+                Some(Duration::from_millis(200)),
+            )
             .await;
 
-        assert!(output.timed_out);
+        assert!(output.timed_out, "stderr={}", output.stderr);
         assert!(output.killed);
         assert!(output.exit_code.is_none());
     }
@@ -255,9 +296,15 @@ mod tests {
     #[tokio::test]
     async fn propagates_nonzero_exit_code() {
         let supervisor = Supervisor::new(4);
-        let output = supervisor.run("bash", &["-c", "exit 42"], None).await;
+        #[cfg(windows)]
+        let script = "exit /B 42";
+        #[cfg(not(windows))]
+        let script = "exit 42";
+        let output = supervisor
+            .run(shell_program(), &[shell_flag(), script], None)
+            .await;
 
-        assert_eq!(output.exit_code, Some(42));
+        assert_eq!(output.exit_code, Some(42), "stderr={}", output.stderr);
         assert!(!output.timed_out);
         assert!(!output.killed);
     }
@@ -265,9 +312,11 @@ mod tests {
     #[tokio::test]
     async fn max_parallel_limits_concurrency() {
         let supervisor = Supervisor::new(2);
-        let output = supervisor.run("bash", &["-c", "echo ok"], None).await;
+        let output = supervisor
+            .run(shell_program(), &[shell_flag(), "echo ok"], None)
+            .await;
 
-        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
         assert_eq!(output.stdout.trim(), "ok");
     }
 
@@ -292,13 +341,21 @@ mod tests {
     #[tokio::test]
     async fn timeout_output_serializes_correctly() {
         let supervisor = Supervisor::new(4);
+        #[cfg(windows)]
+        let script = "ping -n 60 127.0.0.1 >NUL";
+        #[cfg(not(windows))]
+        let script = "sleep 60";
         let output = supervisor
-            .run("sleep", &["60"], Some(Duration::from_millis(200)))
+            .run(
+                shell_program(),
+                &[shell_flag(), script],
+                Some(Duration::from_millis(200)),
+            )
             .await;
 
         let json = serde_json::to_string(&output).unwrap();
-        assert!(json.contains("\"timed_out\":true"));
-        assert!(json.contains("\"killed\":true"));
-        assert!(json.contains("\"exit_code\":null"));
+        assert!(json.contains("\"timed_out\":true"), "{json}");
+        assert!(json.contains("\"killed\":true"), "{json}");
+        assert!(json.contains("\"exit_code\":null"), "{json}");
     }
 }
