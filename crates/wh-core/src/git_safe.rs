@@ -608,30 +608,70 @@ mod tests {
         assert!(display.contains("test message"));
     }
 
+    /// Isolated git repo with a named branch for execution tests.
+    ///
+    /// Avoids depending on the workspace checkout (tarpaulin / detached HEAD).
+    fn temp_repo_with_branch(branch: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wh-core-git-safe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp repo dir");
+
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .expect("spawn git");
+            assert!(status.success(), "git {args:?} failed in {}", dir.display());
+        };
+
+        git(&["init", "-b", branch]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "wh-core-test"]);
+        std::fs::write(dir.join("README"), "init\n").expect("write README");
+        git(&["add", "README"]);
+        git(&["commit", "-m", "init"]);
+        dir
+    }
+
     #[test]
     fn run_status_in_repo_executes() {
-        // Execute a read-only allowlisted command in the current workspace.
-        let cmd = SafeGitCommand::new(&["rev-parse".to_owned(), "--is-inside-work-tree".to_owned()])
-            .unwrap();
-        let out = cmd
-            .run(Path::new("."), None)
-            .expect("git should run in workspace");
+        let repo = temp_repo_with_branch("main");
+        let cmd =
+            SafeGitCommand::new(&["rev-parse".to_owned(), "--is-inside-work-tree".to_owned()])
+                .unwrap();
+        let out = cmd.run(&repo, None).expect("git should run in temp repo");
         assert_eq!(out.exit_code, 0, "stderr={}", out.stderr);
         assert_eq!(out.stdout.trim(), "true");
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn run_verifies_expected_branch_for_mutating() {
-        let current = resolve_current_branch(Path::new(".")).expect("resolve branch");
-        let cmd = SafeGitCommand::new(&["status".to_owned(), "--porcelain".to_owned()]).unwrap();
+        let repo = temp_repo_with_branch("job-branch");
+        let current = resolve_current_branch(&repo).expect("resolve branch");
+        assert_eq!(current, "job-branch");
+
         // status is not mutating — expected_branch is ignored.
-        let out = cmd.run(Path::new("."), Some("definitely-not-this-branch"));
-        assert!(out.is_ok());
+        let cmd = SafeGitCommand::new(&["status".to_owned(), "--porcelain".to_owned()]).unwrap();
+        let out = cmd
+            .run(&repo, Some("definitely-not-this-branch"))
+            .expect("status should run");
+        assert_eq!(out.exit_code, 0, "stderr={}", out.stderr);
 
         // Mutating with wrong branch is rejected before spawn.
         let push = SafeGitCommand::new(&["push".to_owned(), "--dry-run".to_owned()]).unwrap();
         let err = push
-            .run(Path::new("."), Some("definitely-not-this-branch"))
+            .run(&repo, Some("definitely-not-this-branch"))
             .unwrap_err();
         assert!(matches!(
             err,
@@ -641,10 +681,17 @@ mod tests {
             }
         ));
 
-        // Matching branch is accepted (may still fail network; policy must pass first).
-        // Use `status` path already covered; for mutating, verify_branch alone:
-        let push2 = SafeGitCommand::new(&["status".to_owned()]).unwrap();
-        assert!(!push2.requires_branch_check());
-        let _ = current;
+        // Matching branch passes branch verification (push may still fail without a remote).
+        let push_ok = SafeGitCommand::new(&["push".to_owned(), "--dry-run".to_owned()]).unwrap();
+        match push_ok.run(&repo, Some("job-branch")) {
+            Ok(_) => {}
+            Err(Error::PolicyViolation {
+                code: PolicyCode::BranchMismatch,
+                ..
+            }) => panic!("matching branch must not fail branch verification"),
+            Err(_) => {} // e.g. no remote configured
+        }
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
