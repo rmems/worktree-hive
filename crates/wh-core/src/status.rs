@@ -64,9 +64,9 @@ impl fmt::Display for CiClass {
 pub struct JobStatus {
     /// Unique job identifier (e.g. `wh-347`).
     pub job_id: String,
-    /// Repository owner (e.g. `rmems`).
+    /// Repository owner (e.g. `acme`).
     pub owner: String,
-    /// Repository name (e.g. `worktrees-hives`).
+    /// Repository name (e.g. `example-org`).
     pub repo: String,
     /// Linked issue number, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,11 +131,11 @@ mod tests {
     fn sample_job() -> JobStatus {
         JobStatus {
             job_id: "wh-100".to_owned(),
-            owner: "rmems".to_owned(),
-            repo: "worktrees-hives".to_owned(),
+            owner: "acme".to_owned(),
+            repo: "example-org".to_owned(),
             issue_number: Some(29),
             pr_number: Some(42),
-            worktree_path: "/tmp/worktrees/rmems/worktrees-hives/wh-100".to_owned(),
+            worktree_path: "/tmp/worktrees/acme/example-org/wh-100".to_owned(),
             branch: "feature/status-json-cli".to_owned(),
             process_state: ProcessState::Running,
             last_error: None,

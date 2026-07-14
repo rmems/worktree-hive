@@ -70,16 +70,14 @@ fn run_status(
         Ok(jobs) => run_with_jobs(json, command_name, jobs, stdout),
         Err(e) => {
             if json {
-                // Surface load failures in the v1 envelope instead of ok:true + empty jobs.
+                // JSON path: write ok:false envelope, then exit non-zero.
+                // Consumers should parse stdout even on CalledProcessError (see docs/status-schema.md).
                 let response = wh_core::status::status_error(command_name, e.clone());
                 serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
                 stdout.write_all(b"\n")?;
-                Err(io::Error::other(e))
-            } else {
-                // Human mode: warn on stderr and render the empty-set summary.
-                let _ = writeln!(io::stderr(), "wh: warning: {e}");
-                run_with_jobs(false, command_name, Vec::new(), stdout)
             }
+            // Human and JSON: never pretend the empty set is healthy on load failure.
+            Err(io::Error::other(e))
         }
     }
 }
@@ -120,8 +118,8 @@ mod tests {
     fn sample_job() -> JobStatus {
         JobStatus {
             job_id: "wh-1".to_owned(),
-            owner: "rmems".to_owned(),
-            repo: "worktrees-hives".to_owned(),
+            owner: "acme".to_owned(),
+            repo: "example-org".to_owned(),
             issue_number: Some(29),
             pr_number: None,
             worktree_path: "/tmp/wt/wh-1".to_owned(),
@@ -308,15 +306,24 @@ mod tests {
     }
 
     #[test]
-    fn status_human_load_error_prints_empty_summary() {
+    fn status_human_load_error_does_not_print_healthy_empty() {
         let mut stdout = Vec::new();
-        run_status(
+        let err = run_status(
             false,
             "cli.status",
             Err("failed to read watched.json: permission denied".to_owned()),
             &mut stdout,
         )
-        .unwrap();
-        assert_eq!(str::from_utf8(&stdout).unwrap(), "No watched jobs.\n");
+        .unwrap_err();
+        assert!(err.to_string().contains("permission denied"));
+        // Must not look like a healthy empty watch list.
+        assert!(
+            !str::from_utf8(&stdout).unwrap().contains("No watched jobs"),
+            "human load error must not print healthy empty summary"
+        );
+        assert!(
+            stdout.is_empty(),
+            "human load error should not write a success summary to stdout"
+        );
     }
 }
