@@ -93,9 +93,11 @@ jobs:
           persist-credentials: false
 
       - name: Install stable Rust
+        if: needs.check-python-pkg.outputs.has-cargo == 'true'
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Cache Cargo artifacts
+        if: needs.check-python-pkg.outputs.has-cargo == 'true'
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -104,6 +106,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Build wh CLI
+        if: needs.check-python-pkg.outputs.has-cargo == 'true'
         run: cargo build --release --package wh
 
       - name: Install Python package
@@ -114,7 +117,7 @@ jobs:
       - name: Run tests
         env:
           WH_BIN: ${{ github.workspace }}/target/release/wh
-        run: pytest python/tests/ -v --tb=short
+        run: python -m pytest python/tests/ -v --tb=short
 
   build-wheels:
     name: wheel (${{ matrix.target }})
