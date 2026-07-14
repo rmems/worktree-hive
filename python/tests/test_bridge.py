@@ -15,6 +15,7 @@ from worktrees_hives.contract import (
     classify,
 )
 from worktrees_hives.errors import (
+    PolicyError,
     WhBinaryNotFoundError,
     WhJsonDecodeError,
     WhProcessError,
@@ -297,3 +298,22 @@ class TestWhClientRun:
         client = WhClient()
         with pytest.raises(WhProcessError, match="timed out"):
             client.run()
+
+
+class TestPolicyExitCode:
+    @patch("worktrees_hives.bridge.subprocess.run")
+    @patch("worktrees_hives.bridge._resolve_wh_binary", return_value="/usr/bin/wh")
+    def test_exit_2_valid_error_envelope_raises_policy_error(self, mock_resolve, mock_run):
+        envelope = json.dumps(
+            {
+                "ok": False,
+                "schema_version": 1,
+                "command": "worktree.create",
+                "data": {},
+                "error": {"code": "PathEscape", "message": "path outside sandbox"},
+            }
+        )
+        mock_run.return_value = MagicMock(returncode=2, stdout=envelope, stderr="")
+        with pytest.raises(PolicyError, match="PathEscape") as exc_info:
+            WhClient().run("worktree", "create")
+        assert exc_info.value.code == "PathEscape"

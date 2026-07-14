@@ -12,6 +12,7 @@ from worktrees_hives.attribution import (
 from worktrees_hives.bridge import WhClient
 from worktrees_hives.contract import ErrorResponse, Response, SuccessResponse
 from worktrees_hives.errors import (
+    PolicyError,
     WhBinaryNotFoundError,
     WhError,
     WhJsonDecodeError,
@@ -32,6 +33,7 @@ __all__ = [
     "ErrorResponse",
     "Orchestrator",
     "OrchestratorReport",
+    "PolicyError",
     "ReplyTemplate",
     "Response",
     "SuccessResponse",

@@ -41,3 +41,12 @@ class WhSchemaError(WhError):
 
     def __init__(self, detail: str) -> None:
         super().__init__(f"Invalid v1 envelope: {detail}")
+
+
+class PolicyError(WhError):
+    """Raised when wh exits with code 2 (policy violation)."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"Policy violation [{code}]: {message}")
