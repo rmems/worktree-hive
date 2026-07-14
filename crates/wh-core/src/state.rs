@@ -71,7 +71,7 @@ mod tests {
     #[test]
     fn wh_state_path_load_success() {
         // Simulate WH_STATE_PATH pointing at a valid watched.json.
-        let path = resolve_state_path(Some(unique_path("wh-state-ok").to_str().unwrap()));
+        let path = resolve_state_path(Some(unique_path("wh-state-ok").as_os_str()));
         let jobs = vec![sample_job()];
         fs::write(&path, serde_json::to_string(&jobs).unwrap()).unwrap();
 
@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn wh_state_path_load_malformed_json() {
         // Simulate WH_STATE_PATH pointing at a corrupt watched.json.
-        let path = resolve_state_path(Some(unique_path("wh-state-bad").to_str().unwrap()));
+        let path = resolve_state_path(Some(unique_path("wh-state-bad").as_os_str()));
         fs::write(&path, "{not valid json").unwrap();
 
         let err = load_jobs_from(&path).expect_err("malformed JSON must fail");

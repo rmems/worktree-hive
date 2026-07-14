@@ -2,6 +2,7 @@
 //!
 //! Worktree path derivation and escape prevention are implemented by GitHub #25.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// Resolve the platform default user data directory.
@@ -9,14 +10,16 @@ use std::path::{Path, PathBuf};
 /// - Windows: `%APPDATA%` (fallback: `%USERPROFILE%\AppData\Roaming`)
 /// - macOS: `~/Library/Application Support`
 /// - Unix/Linux: `$XDG_DATA_HOME` or `~/.local/share`
+///
+/// Empty environment values are treated as unset so resolution falls back cleanly.
 #[must_use]
 pub fn user_data_dir() -> PathBuf {
     #[cfg(windows)]
     {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
+        if let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
             return PathBuf::from(appdata);
         }
-        if let Some(profile) = std::env::var_os("USERPROFILE") {
+        if let Some(profile) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
             return PathBuf::from(profile).join("AppData").join("Roaming");
         }
         return std::env::temp_dir();
@@ -24,7 +27,7 @@ pub fn user_data_dir() -> PathBuf {
 
     #[cfg(target_os = "macos")]
     {
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
             return PathBuf::from(home)
                 .join("Library")
                 .join("Application Support");
@@ -34,10 +37,11 @@ pub fn user_data_dir() -> PathBuf {
 
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        // Empty XDG_DATA_HOME must not become a relative CWD-local root.
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
             return PathBuf::from(xdg);
         }
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
             return PathBuf::from(home).join(".local").join("share");
         }
         std::env::temp_dir()
@@ -82,11 +86,14 @@ impl StateRoot {
 
 /// Resolve the watched-jobs state path from an optional `WH_STATE_PATH` override.
 ///
-/// When `wh_state_path` is `Some`, that value is used (same as setting the env var).
+/// When `wh_state_path` is `Some` and non-empty, that value is used (same as setting the
+/// env var). Empty overrides are treated as unset. Non-UTF-8 paths are preserved via
+/// [`OsStr`].
+///
 /// Otherwise defaults to [`StateRoot::default_root()`]'s `watched.json`.
 #[must_use]
-pub fn resolve_state_path(wh_state_path: Option<&str>) -> PathBuf {
-    if let Some(custom) = wh_state_path {
+pub fn resolve_state_path(wh_state_path: Option<&OsStr>) -> PathBuf {
+    if let Some(custom) = wh_state_path.filter(|v| !v.is_empty()) {
         return PathBuf::from(custom);
     }
     StateRoot::default_root().watched_json()
@@ -94,15 +101,17 @@ pub fn resolve_state_path(wh_state_path: Option<&str>) -> PathBuf {
 
 /// Resolve the path to the watched-jobs state file.
 ///
-/// Honours `WH_STATE_PATH` if set; otherwise defaults to
-/// [`StateRoot::default_root()`]'s `watched.json`.
+/// Honours `WH_STATE_PATH` if set (including non-UTF-8 values on Unix); otherwise defaults
+/// to [`StateRoot::default_root()`]'s `watched.json`. Empty values are treated as unset.
 #[must_use]
 pub fn state_path() -> PathBuf {
-    resolve_state_path(std::env::var("WH_STATE_PATH").ok().as_deref())
+    resolve_state_path(std::env::var_os("WH_STATE_PATH").as_deref())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
     use super::{StateRoot, resolve_state_path, user_data_dir};
 
     #[test]
@@ -122,13 +131,25 @@ mod tests {
 
     #[test]
     fn resolve_state_path_honours_wh_state_path_override() {
-        let path = resolve_state_path(Some("/tmp/acme/watched.json"));
+        let path = resolve_state_path(Some(OsStr::new("/tmp/acme/watched.json")));
         assert_eq!(path, std::path::PathBuf::from("/tmp/acme/watched.json"));
+    }
+
+    #[test]
+    fn resolve_state_path_empty_override_uses_default() {
+        let path = resolve_state_path(Some(OsStr::new("")));
+        assert!(
+            path.ends_with("worktrees-hives/watched.json")
+                || path.ends_with("worktrees-hives\\watched.json")
+        );
     }
 
     #[test]
     fn resolve_state_path_default_uses_state_root() {
         let path = resolve_state_path(None);
-        assert!(path.ends_with("worktrees-hives/watched.json") || path.ends_with("worktrees-hives\\watched.json"));
+        assert!(
+            path.ends_with("worktrees-hives/watched.json")
+                || path.ends_with("worktrees-hives\\watched.json")
+        );
     }
 }
