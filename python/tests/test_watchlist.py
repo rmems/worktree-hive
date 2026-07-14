@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from worktrees_hives.watchlist import JobState, JobStatus, Watchlist, _atomic_write_json
+from worktrees_hives.watchlist import (
+    JobState,
+    JobStatus,
+    PolicyError,
+    Watchlist,
+    _atomic_write_json,
+)
 
 
 @pytest.fixture
@@ -67,7 +73,7 @@ class TestWatchlistAdd:
             watchlist.add("j1", "rmems", "repo", "br", max_fixes=-1)
 
     def test_add_exceeds_safety_ceiling_raises(self, watchlist: Watchlist) -> None:
-        with pytest.raises(ValueError, match="safety ceiling"):
+        with pytest.raises(PolicyError, match="safety ceiling"):
             watchlist.add("j1", "rmems", "repo", "br", max_fixes=5)
 
     def test_add_duplicate_raises(self, watchlist: Watchlist) -> None:
@@ -172,7 +178,7 @@ class TestWatchlistFixCount:
     def test_exhaust_budget_raises(self, watchlist: Watchlist) -> None:
         watchlist.add("j1", "rmems", "repo", "br", max_fixes=1)
         watchlist.increment_fix_count("j1")
-        with pytest.raises(ValueError, match="exhausted"):
+        with pytest.raises(PolicyError, match="exhausted"):
             watchlist.increment_fix_count("j1")
 
 
@@ -267,3 +273,39 @@ class TestMultiOwner:
         ln_jobs = watchlist.list_jobs(owner="Limen-Neural")
         assert len(rmems_jobs) == 2
         assert len(ln_jobs) == 1
+
+
+class TestCliPolicyExit:
+    """CLI maps PolicyError to exit code 2."""
+
+    def test_add_max_fixes_policy_returns_2(self, tmp_path: Path) -> None:
+        from worktrees_hives.cli import main
+
+        code = main(
+            [
+                "--state",
+                str(tmp_path / "wl.json"),
+                "watchlist",
+                "add",
+                "j1",
+                "rmems",
+                "repo",
+                "br",
+                "--max-fixes",
+                "4",
+            ]
+        )
+        assert code == 2
+
+    def test_add_duplicate_returns_1(self, tmp_path: Path) -> None:
+        from worktrees_hives.cli import main
+
+        state = str(tmp_path / "wl.json")
+        assert (
+            main(["--state", state, "watchlist", "add", "j1", "rmems", "repo", "br"])
+            == 0
+        )
+        assert (
+            main(["--state", state, "watchlist", "add", "j1", "rmems", "repo", "br"])
+            == 1
+        )

@@ -22,6 +22,10 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
+class PolicyError(ValueError):
+    """Safety-policy rejection (maps to CLI exit code 2)."""
+
+
 @dataclass
 class JobState:
     """State of a single job in the watchlist."""
@@ -144,13 +148,13 @@ class Watchlist:
     ) -> JobState:
         """Add a new job to the watchlist.
 
-        Raises ValueError if job_id already exists, max_fixes is negative,
-        or max_fixes exceeds the safety ceiling (3).
+        Raises ValueError if job_id already exists or max_fixes is negative.
+        Raises PolicyError if max_fixes exceeds the safety ceiling (3).
         """
         if max_fixes < 0:
             raise ValueError("max_fixes must be non-negative")
         if max_fixes > 3:
-            raise ValueError(
+            raise PolicyError(
                 f"max_fixes ({max_fixes}) exceeds safety ceiling (3). "
                 "Per AGENTS.md, at most 3 code-fix commits per PR per cycle."
             )
@@ -214,13 +218,13 @@ class Watchlist:
         """Increment the fix count for a job.
 
         Raises KeyError if job_id not found.
-        Raises ValueError if fix budget exhausted.
+        Raises PolicyError if fix budget exhausted.
         """
         job = self._jobs.get(job_id)
         if job is None:
             raise KeyError(f"Job {job_id!r} not found in watchlist")
         if job.fix_count >= job.max_fixes:
-            raise ValueError(
+            raise PolicyError(
                 f"Job {job_id!r} has exhausted its fix budget ({job.max_fixes})"
             )
         job.fix_count += 1

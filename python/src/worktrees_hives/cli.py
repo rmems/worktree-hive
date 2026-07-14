@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from worktrees_hives.watchlist import JobState, JobStatus, Watchlist
+from worktrees_hives.watchlist import JobState, JobStatus, PolicyError, Watchlist
 
 
 def _print_job(job: JobState) -> None:
@@ -33,6 +33,9 @@ def cmd_add(args: argparse.Namespace) -> int:
         )
         print(f"Added job {job.job_id} to watchlist")
         return 0
+    except PolicyError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
