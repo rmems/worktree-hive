@@ -153,9 +153,7 @@ class TestOrchestratorSuccess:
 
     async def test_multiple_workers(self):
         o = Orchestrator(concurrency=2)
-        specs = [
-            WorkerSpec(worker_id=f"w{i}", fn=_ok, args=(f"r{i}",)) for i in range(5)
-        ]
+        specs = [WorkerSpec(worker_id=f"w{i}", fn=_ok, args=(f"r{i}",)) for i in range(5)]
         report = await o.run(specs)
         assert report.total == 5
         assert report.succeeded == 5
@@ -247,9 +245,7 @@ class TestOrchestratorTimeout:
 
     async def test_no_timeout_means_wait(self):
         o = Orchestrator(concurrency=2, default_timeout=None)
-        spec = WorkerSpec(
-            worker_id="w1", fn=_ok, args=("done",), kwargs={"delay": 0.01}
-        )
+        spec = WorkerSpec(worker_id="w1", fn=_ok, args=("done",), kwargs={"delay": 0.01})
         report = await o.run([spec])
         assert report.succeeded == 1
         assert report.results[0].result == "done"
@@ -311,9 +307,7 @@ class TestOrchestratorMixed:
             return f"{a}-{b}"
 
         o = Orchestrator(concurrency=2)
-        spec = WorkerSpec(
-            worker_id="w1", fn=echo, args=("hello",), kwargs={"b": "world"}
-        )
+        spec = WorkerSpec(worker_id="w1", fn=echo, args=("hello",), kwargs={"b": "world"})
         report = await o.run([spec])
         assert report.results[0].result == "hello-world"
 
@@ -351,9 +345,7 @@ class TestOrchestratorStatusCallback:
 
         o = Orchestrator(concurrency=2)
         spec = WorkerSpec(worker_id="w1", fn=_fail)
-        await o.run(
-            [spec], on_status_change=lambda wid, s: transitions.append((wid, s))
-        )
+        await o.run([spec], on_status_change=lambda wid, s: transitions.append((wid, s)))
 
         statuses = [s for _, s in transitions]
         assert WorkerStatus.PENDING in statuses
@@ -365,9 +357,7 @@ class TestOrchestratorStatusCallback:
 
         o = Orchestrator(concurrency=2, default_timeout=0.05)
         spec = WorkerSpec(worker_id="w1", fn=_hang)
-        await o.run(
-            [spec], on_status_change=lambda wid, s: transitions.append((wid, s))
-        )
+        await o.run([spec], on_status_change=lambda wid, s: transitions.append((wid, s)))
 
         statuses = [s for _, s in transitions]
         assert WorkerStatus.TIMED_OUT in statuses
@@ -386,10 +376,7 @@ class TestOrchestratorStatusCallback:
             transitions.append((worker_id, status))
 
         o = Orchestrator(concurrency=1)
-        specs = [
-            WorkerSpec(worker_id=f"w{i}", fn=_ok, kwargs={"delay": 0.01})
-            for i in range(3)
-        ]
+        specs = [WorkerSpec(worker_id=f"w{i}", fn=_ok, kwargs={"delay": 0.01}) for i in range(3)]
         await o.run(specs, on_status_change=on_change)
 
         for wid in ("w0", "w1", "w2"):

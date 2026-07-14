@@ -32,7 +32,6 @@ dev = [
     "ruff>=0.4.0",
     "mypy>=1.10.0",
 ]
-test = ["pytest", "pytest-asyncio"]
 
 [project.urls]
 Homepage = "https://github.com/rmems/worktrees-hives"

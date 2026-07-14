@@ -39,25 +39,17 @@ def _resolve_wh_binary(explicit_path: str | None = None) -> str:
     """
     if explicit_path is not None:
         if not os.path.isfile(explicit_path):
-            raise WhBinaryNotFoundError(
-                f"Explicit wh path does not exist: {explicit_path}"
-            )
+            raise WhBinaryNotFoundError(f"Explicit wh path does not exist: {explicit_path}")
         if not os.access(explicit_path, os.X_OK):
-            raise WhBinaryNotFoundError(
-                f"Explicit wh path is not executable: {explicit_path}"
-            )
+            raise WhBinaryNotFoundError(f"Explicit wh path is not executable: {explicit_path}")
         return explicit_path
 
     env_path = os.environ.get("WH_BIN")
     if env_path:
         if not os.path.isfile(env_path):
-            raise WhBinaryNotFoundError(
-                f"WH_BIN points to non-existent file: {env_path}"
-            )
+            raise WhBinaryNotFoundError(f"WH_BIN points to non-existent file: {env_path}")
         if not os.access(env_path, os.X_OK):
-            raise WhBinaryNotFoundError(
-                f"WH_BIN points to non-executable file: {env_path}"
-            )
+            raise WhBinaryNotFoundError(f"WH_BIN points to non-executable file: {env_path}")
         return env_path
 
     found = shutil.which("wh")
@@ -114,9 +106,7 @@ class WhClient:
                 check=False,
             )
         except OSError as exc:
-            raise WhBinaryNotFoundError(
-                f"Failed to execute wh at {binary}: {exc}"
-            ) from exc
+            raise WhBinaryNotFoundError(f"Failed to execute wh at {binary}: {exc}") from exc
         except subprocess.TimeoutExpired as exc:
             raise WhProcessError(
                 returncode=-1,

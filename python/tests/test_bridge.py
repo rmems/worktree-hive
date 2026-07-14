@@ -213,9 +213,7 @@ class TestWhClientRun:
     @patch("worktrees_hives.bridge.subprocess.run")
     @patch("worktrees_hives.bridge._resolve_wh_binary", return_value="/usr/bin/wh")
     def test_bootstrap_success(self, mock_resolve, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout=FAKE_SUCCESS_JSON, stderr=""
-        )
+        mock_run.return_value = MagicMock(returncode=0, stdout=FAKE_SUCCESS_JSON, stderr="")
         client = WhClient()
         result = client.bootstrap()
         assert isinstance(result, SuccessResponse)
@@ -225,9 +223,7 @@ class TestWhClientRun:
     @patch("worktrees_hives.bridge.subprocess.run")
     @patch("worktrees_hives.bridge._resolve_wh_binary", return_value="/usr/bin/wh")
     def test_error_response(self, mock_resolve, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout=FAKE_ERROR_JSON, stderr=""
-        )
+        mock_run.return_value = MagicMock(returncode=0, stdout=FAKE_ERROR_JSON, stderr="")
         client = WhClient()
         result = client.run("some-command")
         assert isinstance(result, ErrorResponse)
@@ -236,9 +232,7 @@ class TestWhClientRun:
     @patch("worktrees_hives.bridge.subprocess.run")
     @patch("worktrees_hives.bridge._resolve_wh_binary", return_value="/usr/bin/wh")
     def test_nonzero_exit_raises_process_error(self, mock_resolve, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=2, stdout="", stderr="wh: unknown command"
-        )
+        mock_run.return_value = MagicMock(returncode=2, stdout="", stderr="wh: unknown command")
         client = WhClient()
         with pytest.raises(WhProcessError, match="exited with code 2"):
             client.run("bad-cmd")
@@ -254,9 +248,7 @@ class TestWhClientRun:
     @patch("worktrees_hives.bridge.subprocess.run")
     @patch("worktrees_hives.bridge._resolve_wh_binary", return_value="/usr/bin/wh")
     def test_invalid_json_raises_decode_error(self, mock_resolve, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout="not json at all", stderr=""
-        )
+        mock_run.return_value = MagicMock(returncode=0, stdout="not json at all", stderr="")
         client = WhClient()
         with pytest.raises(WhJsonDecodeError, match="Failed to decode"):
             client.run()
@@ -273,9 +265,7 @@ class TestWhClientRun:
     @patch("worktrees_hives.bridge.subprocess.run")
     @patch("worktrees_hives.bridge._resolve_wh_binary", return_value="/usr/bin/wh")
     def test_args_passed_to_subprocess(self, mock_resolve, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout=FAKE_SUCCESS_JSON, stderr=""
-        )
+        mock_run.return_value = MagicMock(returncode=0, stdout=FAKE_SUCCESS_JSON, stderr="")
         client = WhClient()
         client.run("worktree", "create", "--issue", "123")
         call_args = mock_run.call_args
@@ -285,9 +275,7 @@ class TestWhClientRun:
     @patch("worktrees_hives.bridge._resolve_wh_binary", return_value="/usr/bin/wh")
     def test_timeout_forwarded_to_subprocess(self, mock_resolve):
         with patch("worktrees_hives.bridge.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0, stdout=FAKE_SUCCESS_JSON, stderr=""
-            )
+            mock_run.return_value = MagicMock(returncode=0, stdout=FAKE_SUCCESS_JSON, stderr="")
             client = WhClient(timeout=60.0)
             client.run()
             assert mock_run.call_args[1]["timeout"] == 60.0

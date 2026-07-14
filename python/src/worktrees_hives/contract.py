@@ -60,9 +60,7 @@ class Response:
         if command is None:
             raise WhSchemaError("'command' is required")
         if not isinstance(command, str):
-            raise WhSchemaError(
-                f"'command' must be a str, got {type(command).__name__}"
-            )
+            raise WhSchemaError(f"'command' must be a str, got {type(command).__name__}")
 
         data = raw.get("data")
         if data is None:
