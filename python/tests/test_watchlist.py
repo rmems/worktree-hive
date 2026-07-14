@@ -301,11 +301,5 @@ class TestCliPolicyExit:
         from worktrees_hives.cli import main
 
         state = str(tmp_path / "wl.json")
-        assert (
-            main(["--state", state, "watchlist", "add", "j1", "rmems", "repo", "br"])
-            == 0
-        )
-        assert (
-            main(["--state", state, "watchlist", "add", "j1", "rmems", "repo", "br"])
-            == 1
-        )
+        assert main(["--state", state, "watchlist", "add", "j1", "rmems", "repo", "br"]) == 0
+        assert main(["--state", state, "watchlist", "add", "j1", "rmems", "repo", "br"]) == 1

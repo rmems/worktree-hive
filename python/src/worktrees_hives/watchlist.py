@@ -73,9 +73,7 @@ def _default_state_path() -> Path:
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     """Write JSON atomically using temp file + rename."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        dir=path.parent, suffix=".tmp", prefix=".watchlist-"
-    )
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp", prefix=".watchlist-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, sort_keys=True)
@@ -224,9 +222,7 @@ class Watchlist:
         if job is None:
             raise KeyError(f"Job {job_id!r} not found in watchlist")
         if job.fix_count >= job.max_fixes:
-            raise PolicyError(
-                f"Job {job_id!r} has exhausted its fix budget ({job.max_fixes})"
-            )
+            raise PolicyError(f"Job {job_id!r} has exhausted its fix budget ({job.max_fixes})")
         job.fix_count += 1
         self._save()
         return job

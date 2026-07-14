@@ -105,9 +105,7 @@ def main(argv: list[str] | None = None) -> int:
     add_p.add_argument("repo", help="Repository name")
     add_p.add_argument("branch", help="Branch name")
     add_p.add_argument("--stack-id", help="Stack membership identifier")
-    add_p.add_argument(
-        "--max-fixes", type=int, default=3, help="Max fix commits (default: 3)"
-    )
+    add_p.add_argument("--max-fixes", type=int, default=3, help="Max fix commits (default: 3)")
 
     # watchlist remove
     rm_p = wl_sub.add_parser("remove", help="Remove a job from the watchlist")
