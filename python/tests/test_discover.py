@@ -12,6 +12,7 @@ from worktrees_hives.discover import (
     DiscoveryResult,
     Issue,
     IssueState,
+    OwnerPolicyError,
     _parse_issue,
     discover_all,
     discover_issues_for_repo,
@@ -133,9 +134,7 @@ class TestDiscoverIssuesForRepo:
     """Tests for discover_issues_for_repo function."""
 
     @patch("worktrees_hives.discover._run_gh")
-    def test_discover_issues_success(
-        self, mock_run_gh: MagicMock, sample_issue_data: dict
-    ) -> None:
+    def test_discover_issues_success(self, mock_run_gh: MagicMock, sample_issue_data: dict) -> None:
         """Test successful issue discovery."""
         mock_run_gh.return_value = (json.dumps([sample_issue_data]), "", 0)
 
@@ -155,7 +154,7 @@ class TestDiscoverIssuesForRepo:
                 "--json",
                 "number,title,state,labels,milestone,url,assignees,createdAt,updatedAt",
                 "--limit",
-                "100",
+                "1000",
             ]
         )
 
@@ -198,9 +197,7 @@ class TestDiscoverIssuesForRepo:
         """Test issue discovery with state filter."""
         mock_run_gh.return_value = (json.dumps([sample_issue_data]), "", 0)
 
-        issues, error = discover_issues_for_repo(
-            "rmems", "test-repo", IssueState.CLOSED
-        )
+        issues, error = discover_issues_for_repo("rmems", "test-repo", IssueState.CLOSED)
 
         assert error is None
         mock_run_gh.assert_called_once_with(
@@ -214,7 +211,7 @@ class TestDiscoverIssuesForRepo:
                 "--json",
                 "number,title,state,labels,milestone,url,assignees,createdAt,updatedAt",
                 "--limit",
-                "100",
+                "1000",
             ]
         )
 
@@ -223,9 +220,7 @@ class TestDiscoverPullRequestsForRepo:
     """Tests for discover_pull_requests_for_repo function."""
 
     @patch("worktrees_hives.discover._run_gh")
-    def test_discover_prs_success(
-        self, mock_run_gh: MagicMock, sample_pr_data: dict
-    ) -> None:
+    def test_discover_prs_success(self, mock_run_gh: MagicMock, sample_pr_data: dict) -> None:
         """Test successful PR discovery."""
         mock_run_gh.return_value = (json.dumps([sample_pr_data]), "", 0)
 
@@ -294,7 +289,7 @@ class TestDiscoverAll:
         mock_discover_issues.return_value = ([sample_issue], None)
         mock_discover_prs.return_value = ([sample_pr], None)
 
-        result = discover_all()
+        result = discover_all(check_auth=False)
 
         # Each owner contributes 1 issue + 1 PR = 2 per owner, 2 owners = 4 total
         assert len(result.issues) == 4
@@ -306,7 +301,7 @@ class TestDiscoverAll:
         """Test handling of repo listing errors in discover_all."""
         mock_list_repos.return_value = ([], "Failed to list repos")
 
-        result = discover_all()
+        result = discover_all(check_auth=False)
 
         assert len(result.issues) == 0
         assert len(result.errors) == 2  # One error per owner
@@ -323,7 +318,7 @@ class TestDiscoverAll:
         mock_list_repos.return_value = (["test-repo"], None)
         mock_discover_issues.return_value = ([sample_issue], None)
 
-        result = discover_all(include_prs=False)
+        result = discover_all(include_prs=False, check_auth=False)
 
         # Each owner contributes 1 issue, 2 owners = 2 total
         assert len(result.issues) == 2
@@ -342,7 +337,7 @@ class TestDiscoverAll:
         mock_discover_issues.return_value = ([sample_issue], None)
 
         custom_owners = ["custom-owner"]
-        result = discover_all(owners=custom_owners)
+        result = discover_all(owners=custom_owners, allow_non_default_owners=True, check_auth=False)
 
         assert result.owners_scanned == custom_owners
         mock_list_repos.assert_called_once_with("custom-owner")
@@ -423,9 +418,7 @@ class TestFilterIssues:
 class TestFormatForOrchestrator:
     """Tests for format_for_orchestrator function."""
 
-    def test_format_for_orchestrator(
-        self, sample_issue: Issue, sample_pr: Issue
-    ) -> None:
+    def test_format_for_orchestrator(self, sample_issue: Issue, sample_pr: Issue) -> None:
         """Test formatting for orchestrator consumption."""
         result = DiscoveryResult(
             issues=[sample_issue, sample_pr],
@@ -483,3 +476,75 @@ class TestAllowedOwners:
         assert "rmems" in ALLOWED_OWNERS
         assert "Limen-Neural" in ALLOWED_OWNERS
         assert len(ALLOWED_OWNERS) == 2
+
+
+class TestOwnerPolicy:
+    """Owner allowlist and override behavior."""
+
+    def test_reject_non_default_owners(self) -> None:
+        with pytest.raises(OwnerPolicyError, match="allow_non_default_owners"):
+            discover_all(owners=["evil-corp"], check_auth=False)
+
+    def test_owners_scanned_is_copy(self) -> None:
+        with (
+            patch(
+                "worktrees_hives.discover.list_repos_for_owner",
+                return_value=([], None),
+            ),
+            patch("worktrees_hives.discover.ensure_gh_auth", return_value=None),
+        ):
+            result = discover_all(check_auth=True)
+        assert result.owners_scanned == ALLOWED_OWNERS
+        assert result.owners_scanned is not ALLOWED_OWNERS
+        result.owners_scanned.append("mutated")
+        assert "mutated" not in ALLOWED_OWNERS
+
+
+class TestAuthFailFast:
+    @patch(
+        "worktrees_hives.discover.ensure_gh_auth",
+        return_value="GitHub CLI authentication failed",
+    )
+    def test_auth_failure_short_circuits(self, mock_auth: MagicMock) -> None:
+        result = discover_all(check_auth=True)
+        assert result.issues == []
+        assert any("authentication failed" in e.lower() for e in result.errors)
+
+
+class TestPrOnlyMode:
+    @patch("worktrees_hives.discover.list_repos_for_owner", return_value=(["r"], None))
+    @patch("worktrees_hives.discover.discover_issues_for_repo")
+    @patch("worktrees_hives.discover.discover_pull_requests_for_repo")
+    def test_kind_prs_skips_issues(
+        self,
+        mock_prs: MagicMock,
+        mock_issues: MagicMock,
+        mock_repos: MagicMock,
+        sample_pr: Issue,
+    ) -> None:
+        mock_prs.return_value = ([sample_pr], None)
+        result = discover_all(kind="prs", check_auth=False)
+        mock_issues.assert_not_called()
+        mock_prs.assert_called()
+        assert all(i.is_pr for i in result.issues)
+
+
+class TestCiRollup:
+    def test_parse_pr_ci_status(self) -> None:
+        data = {
+            "number": 1,
+            "title": "PR",
+            "state": "OPEN",
+            "labels": [],
+            "milestone": None,
+            "url": "https://example.com",
+            "assignees": [],
+            "createdAt": "2025-01-01T00:00:00Z",
+            "updatedAt": "2025-01-01T00:00:00Z",
+            "pullRequest": {},
+            "statusCheckRollup": [
+                {"name": "ci", "state": "SUCCESS", "conclusion": "SUCCESS"},
+            ],
+        }
+        issue = _parse_issue(data, "rmems", "repo")
+        assert issue.ci_status == "success"
