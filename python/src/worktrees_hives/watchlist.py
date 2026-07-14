@@ -8,7 +8,7 @@ import os
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -16,7 +16,18 @@ from typing import Any
 # Documented state filename (AGENTS.md / Rust contract). Override with WH_STATE_PATH.
 STATE_FILENAME = "watched.json"
 WH_STATE_PATH_ENV = "WH_STATE_PATH"
+WH_ALLOWED_OWNERS_ENV = "WH_ALLOWED_OWNERS"
 MAX_FIXES_CEILING = 3
+
+# Empty default — no org hardcoding. Configure via WH_ALLOWED_OWNERS or
+# Watchlist(allowed_owners=...). Empty allowlist = allow any owner.
+ALLOWED_OWNERS: frozenset[str] = frozenset()
+
+
+def load_allowed_owners_from_env() -> frozenset[str]:
+    """Parse WH_ALLOWED_OWNERS (comma-separated). Empty/unset → empty set."""
+    raw = os.environ.get(WH_ALLOWED_OWNERS_ENV, "")
+    return frozenset(part.strip() for part in raw.split(",") if part.strip())
 
 
 class JobStatus(str, Enum):
@@ -72,7 +83,11 @@ class JobState:
     @property
     def fix_budget_remaining(self) -> int:
         """Return remaining fix commits allowed."""
-        return max(0, self.max_fixes - self.fix_count)
+        return max(0, min(self.max_fixes, MAX_FIXES_CEILING) - self.fix_count)
+
+
+# Known JobState field names for additive-v1 compatibility (ignore extras on construct).
+_JOB_STATE_FIELDS: frozenset[str] = frozenset(f.name for f in fields(JobState))
 
 
 def _platform_data_dir() -> Path:
@@ -174,9 +189,19 @@ class Watchlist:
     watched.json, or WH_STATE_PATH). Writes are atomic (temp file + rename).
     """
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | None = None,
+        allowed_owners: frozenset[str] | None = None,
+    ) -> None:
         self._path = path or _default_state_path()
         self._jobs: dict[str, JobState] = {}
+        # Additive v1 fields (kind, worktree_path, timestamps, …) preserved per job.
+        self._job_extras: dict[str, dict[str, Any]] = {}
+        if allowed_owners is None:
+            self._allowed_owners = load_allowed_owners_from_env()
+        else:
+            self._allowed_owners = frozenset(allowed_owners)
         self._load()
 
     @property
@@ -185,15 +210,25 @@ class Watchlist:
         return self._path
 
     def _load(self) -> None:
-        """Load state from disk; re-validate max_fixes on load."""
+        """Load state from disk; re-validate max_fixes on load.
+
+        Unknown keys on job objects are treated as additive v1 fields: filtered
+        out of JobState construction and preserved for round-trip on save so a
+        compatible writer (e.g. Rust) does not lose watched jobs.
+        """
         data = _read_json(self._path)
         jobs_data = data.get("jobs", {})
         if not isinstance(jobs_data, dict):
             jobs_data = {}
         self._jobs = {}
+        self._job_extras = {}
         for job_id, job_dict in jobs_data.items():
             try:
-                d = dict(job_dict)
+                if not isinstance(job_dict, dict):
+                    continue
+                raw = dict(job_dict)
+                extras = {k: v for k, v in raw.items() if k not in _JOB_STATE_FIELDS}
+                d = {k: v for k, v in raw.items() if k in _JOB_STATE_FIELDS}
                 d["status"] = JobStatus(d["status"])
                 max_fixes = int(d.get("max_fixes", 3))
                 _validate_max_fixes(max_fixes)
@@ -202,20 +237,31 @@ class Watchlist:
                 if fix_count < 0:
                     continue
                 d["fix_count"] = fix_count
-                self._jobs[str(job_id)] = JobState(**d)
+                jid = str(job_id)
+                self._jobs[jid] = JobState(**d)
+                if extras:
+                    self._job_extras[jid] = extras
             except (KeyError, ValueError, TypeError, PolicyError):
                 continue  # skip corrupt/incompatible entry
 
     def _save(self) -> None:
         """Save state to disk atomically."""
-        data = {
+        jobs: dict[str, dict[str, Any]] = {}
+        for jid, job in self._jobs.items():
+            job_dict: dict[str, Any] = asdict(job)
+            # Enum values → strings for JSON
+            status = job_dict.get("status")
+            if isinstance(status, JobStatus):
+                job_dict["status"] = status.value
+            # Preserve additive v1 fields from compatible writers
+            for key, value in self._job_extras.get(jid, {}).items():
+                if key not in job_dict:
+                    job_dict[key] = value
+            jobs[jid] = job_dict
+        data: dict[str, Any] = {
             "schema_version": 1,
-            "jobs": {jid: asdict(j) for jid, j in self._jobs.items()},
+            "jobs": jobs,
         }
-        # Enum values → strings for JSON
-        for job_dict in data["jobs"].values():
-            if isinstance(job_dict.get("status"), JobStatus):
-                job_dict["status"] = job_dict["status"].value
         _atomic_write_json(self._path, data)
 
     def add(
@@ -230,9 +276,16 @@ class Watchlist:
         """Add a new job to the watchlist.
 
         Raises ValueError if job_id already exists or max_fixes is negative.
-        Raises PolicyError if max_fixes exceeds the safety ceiling (3).
+        Raises PolicyError if max_fixes exceeds the safety ceiling (3) or
+        owner is outside the configured allowlist.
         """
         max_fixes = _validate_max_fixes(max_fixes)
+        if self._allowed_owners and owner not in self._allowed_owners:
+            raise PolicyError(
+                f"Owner {owner!r} not in allowed owners: "
+                f"{sorted(self._allowed_owners)}. "
+                f"Set {WH_ALLOWED_OWNERS_ENV} or pass allowed_owners=."
+            )
         if job_id in self._jobs:
             raise ValueError(f"Job {job_id!r} already exists in watchlist")
         job = JobState(
@@ -255,6 +308,7 @@ class Watchlist:
         if job_id not in self._jobs:
             raise KeyError(f"Job {job_id!r} not found in watchlist")
         del self._jobs[job_id]
+        self._job_extras.pop(job_id, None)
         self._save()
 
     def get(self, job_id: str) -> JobState | None:
@@ -292,14 +346,21 @@ class Watchlist:
     def increment_fix_count(self, job_id: str) -> JobState:
         """Increment the fix count for a job.
 
+        Enforces both the per-job max_fixes budget and the global safety
+        ceiling (MAX_FIXES_CEILING) so a misconfigured max cannot exceed policy.
+
         Raises KeyError if job_id not found.
-        Raises PolicyError if fix budget exhausted.
+        Raises PolicyError if fix budget or safety ceiling is exhausted.
         """
         job = self._jobs.get(job_id)
         if job is None:
             raise KeyError(f"Job {job_id!r} not found in watchlist")
-        if job.fix_count >= job.max_fixes:
-            raise PolicyError(f"Job {job_id!r} has exhausted its fix budget ({job.max_fixes})")
+        effective_max = min(job.max_fixes, MAX_FIXES_CEILING)
+        if job.fix_count >= effective_max:
+            raise PolicyError(
+                f"Job {job_id!r} has exhausted its fix budget "
+                f"({effective_max}; ceiling {MAX_FIXES_CEILING})"
+            )
         job.fix_count += 1
         self._save()
         return job

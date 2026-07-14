@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from worktrees_hives.watchlist import (
+    ALLOWED_OWNERS,
     CorruptStateError,
     JobState,
     JobStatus,
@@ -15,6 +16,7 @@ from worktrees_hives.watchlist import (
     Watchlist,
     _atomic_write_json,
     _default_state_path,
+    load_allowed_owners_from_env,
 )
 
 
@@ -240,6 +242,98 @@ class TestWatchlistFixCount:
         watchlist.increment_fix_count("j1")
         with pytest.raises(PolicyError, match="exhausted"):
             watchlist.increment_fix_count("j1")
+
+    def test_safety_ceiling_enforced_on_increment(
+        self, state_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Even if max_fixes were higher in memory, ceiling still caps increments."""
+        monkeypatch.delenv("WH_ALLOWED_OWNERS", raising=False)
+        w = Watchlist(state_path)
+        w.add("j1", "acme", "repo", "br", max_fixes=3)
+        job = w.get("j1")
+        assert job is not None
+        # Simulate a corrupted in-memory max that still must hit the ceiling.
+        job.max_fixes = 10
+        for _ in range(3):
+            w.increment_fix_count("j1")
+        with pytest.raises(PolicyError, match="exhausted|ceiling"):
+            w.increment_fix_count("j1")
+
+
+class TestOwnerAllowlist:
+    """Tests for WH_ALLOWED_OWNERS / allowed_owners on add."""
+
+    def test_default_allowed_owners_empty(self) -> None:
+        assert frozenset() == ALLOWED_OWNERS
+
+    def test_empty_allowlist_allows_any(
+        self, state_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("WH_ALLOWED_OWNERS", raising=False)
+        w = Watchlist(state_path)
+        job = w.add("j1", "other-owner", "repo", "br")
+        assert job.owner == "other-owner"
+
+    def test_env_allowlist_rejects_other_owner(
+        self, state_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme")
+        w = Watchlist(state_path)
+        with pytest.raises(PolicyError, match="not in allowed owners"):
+            w.add("j1", "other-owner", "repo", "br")
+        w.add("j2", "acme", "repo", "br")
+        assert w.get("j2") is not None
+
+    def test_constructor_allowlist(self, state_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("WH_ALLOWED_OWNERS", raising=False)
+        w = Watchlist(state_path, allowed_owners=frozenset({"acme"}))
+        with pytest.raises(PolicyError, match="not in allowed owners"):
+            w.add("j1", "evil", "repo", "br")
+
+    def test_load_allowed_owners_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme, example-org")
+        assert load_allowed_owners_from_env() == frozenset({"acme", "example-org"})
+
+
+class TestAdditiveV1Fields:
+    """v1 schema: unknown job keys must not drop the job."""
+
+    def test_additive_fields_preserved_on_roundtrip(self, state_path: Path) -> None:
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "jobs": {
+                        "j1": {
+                            "job_id": "j1",
+                            "owner": "acme",
+                            "repo": "r",
+                            "branch": "br",
+                            "status": "pending",
+                            "max_fixes": 3,
+                            "fix_count": 0,
+                            "residual_blockers": [],
+                            "kind": "issue",
+                            "worktree_path": "/tmp/wt",
+                            "created_at": "2026-01-01T00:00:00Z",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        w = Watchlist(state_path)
+        job = w.get("j1")
+        assert job is not None
+        assert job.owner == "acme"
+        # Touch state so extras are written back
+        w.update_status("j1", JobStatus.IN_PROGRESS)
+        reloaded = json.loads(state_path.read_text(encoding="utf-8"))
+        entry = reloaded["jobs"]["j1"]
+        assert entry["kind"] == "issue"
+        assert entry["worktree_path"] == "/tmp/wt"
+        assert entry["created_at"] == "2026-01-01T00:00:00Z"
+        assert entry["status"] == "in_progress"
 
 
 class TestWatchlistBlockers:
