@@ -106,6 +106,23 @@ pub fn status_response(command: &'static str, jobs: Vec<JobStatus>) -> StatusRep
     Response::success(command, JobsData { jobs })
 }
 
+/// Build a failure v1 envelope when watched state cannot be loaded.
+///
+/// Serializes as `{ ok: false, schema_version, command, data: { jobs: [] }, error: { code, message } }`.
+#[must_use]
+pub fn status_error(command: &'static str, message: String) -> StatusReport {
+    Response {
+        ok: false,
+        schema_version: crate::contract::SCHEMA_VERSION,
+        command,
+        data: JobsData { jobs: Vec::new() },
+        error: Some(crate::contract::ErrorData {
+            code: "STATE_LOAD_FAILED".to_owned(),
+            message,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +215,27 @@ mod tests {
         let response = status_response("cli.jobs", Vec::new());
         assert!(response.data.jobs.is_empty());
         assert!(response.ok);
+    }
+
+    #[test]
+    fn status_error_sets_ok_false_and_error_payload() {
+        let response = status_error("cli.status", "parse failed".to_owned());
+        let json = serde_json::to_string(&response).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v.get("ok").expect("missing ok"), false);
+        assert_eq!(v.get("command").expect("missing command"), "cli.status");
+        let err = v.get("error").expect("missing error");
+        assert_eq!(err.get("code").expect("missing code"), "STATE_LOAD_FAILED");
+        assert_eq!(err.get("message").expect("missing message"), "parse failed");
+        let jobs = v
+            .get("data")
+            .expect("missing data")
+            .get("jobs")
+            .expect("missing data.jobs")
+            .as_array()
+            .expect("data.jobs must be array");
+        assert!(jobs.is_empty());
     }
 
     #[test]

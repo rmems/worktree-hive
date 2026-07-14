@@ -9,7 +9,7 @@ This file defines how coding agents contribute to `worktrees-hives` and how the 
 - The Cloud VM ships with the Rust stable toolchain (honoring `rust-toolchain.toml`), `cargo`, `git`, and `gh` preinstalled. The startup update script runs `cargo fetch`, so dependencies are already downloaded when a session begins.
 - This repository is currently a **Rust-only workspace**. The `python/` package referenced elsewhere in this file is planned but not present yet, so there is nothing Python to install or run today.
 - Build/test/lint/run commands are standard and documented in `README.md`. Do not duplicate them here.
-- Non-obvious runtime gotcha: the `wh` CLI is scaffold-stage and prints output **only** when the global `--json` flag is passed. Bare `wh`, `wh status`, and `wh jobs` produce no stdout by design — this is expected, not a bug. Use `wh --json`, `wh status --json`, `wh jobs --json` to see the v1 JSON envelopes.
+- Non-obvious runtime gotcha: bare `wh` (no subcommand) prints nothing to stdout unless `--json` is passed. `wh status` and `wh jobs` print a human-readable summary by default; pass `--json` for the v1 JSON envelope.
 
 ## Non-negotiable safety
 

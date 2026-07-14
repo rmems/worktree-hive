@@ -43,14 +43,7 @@ fn run(cli: Cli, stdout: &mut impl Write) -> io::Result<()> {
                 Command::Status => "cli.status",
                 Command::Jobs => "cli.jobs",
             };
-            let jobs = match wh_core::state::load_jobs() {
-                Ok(j) => j,
-                Err(e) => {
-                    let _ = writeln!(io::stderr(), "wh: warning: {e}");
-                    Vec::new()
-                }
-            };
-            run_with_jobs(cli.json, command_name, jobs, stdout)
+            run_status(cli.json, command_name, wh_core::state::load_jobs(), stdout)
         }
         None => {
             if cli.json {
@@ -62,6 +55,31 @@ fn run(cli: Cli, stdout: &mut impl Write) -> io::Result<()> {
                 stdout.write_all(b"\n")?;
             }
             Ok(())
+        }
+    }
+}
+
+/// Render status/jobs from a preloaded `load_jobs` result (testable without env mutation).
+fn run_status(
+    json: bool,
+    command_name: &'static str,
+    jobs_result: Result<Vec<wh_core::status::JobStatus>, String>,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    match jobs_result {
+        Ok(jobs) => run_with_jobs(json, command_name, jobs, stdout),
+        Err(e) => {
+            if json {
+                // Surface load failures in the v1 envelope instead of ok:true + empty jobs.
+                let response = wh_core::status::status_error(command_name, e.clone());
+                serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+                stdout.write_all(b"\n")?;
+                Err(io::Error::other(e))
+            } else {
+                // Human mode: warn on stderr and render the empty-set summary.
+                let _ = writeln!(io::stderr(), "wh: warning: {e}");
+                run_with_jobs(false, command_name, Vec::new(), stdout)
+            }
         }
     }
 }
@@ -97,7 +115,7 @@ mod tests {
     use std::str;
     use wh_core::status::{CiClass, JobStatus, ProcessState};
 
-    use super::{Cli, run_with_jobs};
+    use super::{Cli, run_status, run_with_jobs};
 
     fn sample_job() -> JobStatus {
         JobStatus {
@@ -254,5 +272,51 @@ mod tests {
         assert!(output.contains("wh-1"));
         assert!(output.contains("running"));
         assert!(output.contains("feature/foo"));
+    }
+
+    #[test]
+    fn status_json_load_error_emits_failure_envelope() {
+        let mut stdout = Vec::new();
+        let err = run_status(
+            true,
+            "cli.status",
+            Err("failed to parse watched.json: expected value".to_owned()),
+            &mut stdout,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("failed to parse"));
+
+        let output = str::from_utf8(&stdout).unwrap();
+        let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(v.get("ok").expect("missing ok"), false);
+        assert_eq!(
+            v.get("error")
+                .expect("missing error")
+                .get("code")
+                .expect("missing code"),
+            "STATE_LOAD_FAILED"
+        );
+        assert!(
+            v.get("data")
+                .expect("missing data")
+                .get("jobs")
+                .expect("missing jobs")
+                .as_array()
+                .expect("jobs array")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn status_human_load_error_prints_empty_summary() {
+        let mut stdout = Vec::new();
+        run_status(
+            false,
+            "cli.status",
+            Err("failed to read watched.json: permission denied".to_owned()),
+            &mut stdout,
+        )
+        .unwrap();
+        assert_eq!(str::from_utf8(&stdout).unwrap(), "No watched jobs.\n");
     }
 }
