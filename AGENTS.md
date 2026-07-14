@@ -6,7 +6,80 @@ This file defines how coding agents contribute to `worktrees-hives` and how the 
 
 ## Non-negotiable safety
 
+**These rules are absolute. No agent, orchestrator, or platform override may relax them.**
+
+### Core prohibitions
+
+- **Never merge** a pull request or invoke a merge API. A human must merge.
+- **Never use bare `git push --force`** or `git push -f`. Only `--force-with-lease` is permitted, and only for rebasing your own branch.
+- **Never edit outside** a job's assigned worktree or branch.
 - **Repository scope** is a **configured owner allowlist** (`WH_ALLOWED_OWNERS` and/or explicit API args). There is no built-in default org.
+- **Limit code-fix commits** to three per PR per babysit cycle. Replies are unlimited.
+- **Process stacked PRs** from the bottom of the stack upward.
+- **Post review replies** only after pushing, and include the pushed SHA plus agent attribution.
+
+### Deny-list (never execute)
+
+| Command / Operation | Reason |
+| --- | --- |
+| `gh pr merge` | Agents never merge PRs. |
+| `gh pr merge --auto` | Auto-merge is still a merge. |
+| `git push --force` (bare) | Destructive; loses history. |
+| `git push -f` (bare) | Short form of same destructive push. |
+| GraphQL `mergePullRequest` | Merge via API is still a merge. |
+| REST `PUT /repos/.../merge` | Merge via REST is still a merge. |
+
+### Allow-list for force-with-lease
+
+`git push --force-with-lease` is permitted **only** when:
+1. Rebasing your own feature branch onto an updated base.
+2. Fixing a force-push that failed due to a stale remote ref.
+3. The operator explicitly instructs a force-push.
+
+Before using `--force-with-lease`, verify:
+- Current branch is the assigned worktree branch (not `main` or another agent's branch).
+- Remote ref matches expectations (no unexpected pushes from others).
+
+### Fix-cap semantics
+
+Each PR gets a maximum of **3 code-fix commits** per babysit cycle.
+
+- **Counts:** Commits changing source code, tests, config, or behavior-affecting docs.
+- **Does not count:** Merge commits from rebasing, CI-triggered commits, reply comments.
+- **At cap:** Stop committing. Report residual issues as PR comments. Continue replying to reviews and monitoring CI.
+- **Residual reporting:** Post a comment listing remaining CI failures, unresolved review threads, and recommended next steps.
+- **Reset:** Cap resets when the operator starts a new babysit cycle.
+
+### Branch/worktree pre-edit checklist
+
+Before making any code change, verify:
+
+1. **Worktree isolation:** `pwd` is inside the assigned worktree path.
+2. **Branch correctness:** `git branch --show-current` matches the assigned feature branch.
+3. **Clean state:** `git status` shows no uncommitted changes from other work.
+4. **Remote alignment:** `git fetch && git status` confirms the branch tracks the expected remote.
+5. **No cross-boundary edits:** No file outside the worktree is modified.
+
+If any check fails, abort and report the mismatch.
+
+### Final status guidance
+
+When a babysit cycle ends, report:
+
+- **PR status:** Open / Ready for review / Blocked
+- **Fix count:** Number of code-fix commits pushed (e.g., "2/3")
+- **Residual issues:** Unresolved CI failures, review comments, or blockers
+- **Agent attribution:** Every PR comment and commit message includes agent identification
+
+**Never claim you merged a PR.** If the PR appears merged, report "PR was merged by a human" and stop.
+
+### Enforcement layers
+
+These guardrails are enforced at multiple layers:
+
+1. **Agent skill (`SKILL.md`):** Portable documentation and prompt templates. Not a security boundary.
+2. **Python orchestrator:** Policy enforcement via subprocess bridge. Counts fix commits, validates paths, blocks deny-listed commands.
+3. **Rust core (`wh-core`):** Hard enforcement. Rejects unsafe git/GitHub operations at the process boundary. Authoritative safety layer.
 
 Rust must enforce safety-sensitive mutation rules. Skill instructions and Python checks provide defense in depth but are not sufficient on their own.
 
