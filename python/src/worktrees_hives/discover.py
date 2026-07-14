@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import subprocess
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Literal
 
 # Soft per-resource fetch cap. gh list commands paginate internally up to --limit.
+# When a response hits this cap, DiscoveryResult.truncated is set True (no silent drop).
 DISCOVERY_ITEM_LIMIT = 1000
 
+# Env var: comma-separated owner allowlist. Empty/unset = empty default (no org hardcoding).
+WH_ALLOWED_OWNERS_ENV = "WH_ALLOWED_OWNERS"
+
 DiscoveryKind = Literal["all", "issues", "prs"]
+
+logger = logging.getLogger(__name__)
 
 
 class IssueState(str, Enum):
@@ -46,19 +54,32 @@ class Issue:
 
 @dataclass(frozen=True)
 class DiscoveryResult:
-    """Result of discovering issues across allowed owners."""
+    """Result of discovering issues across allowed owners.
+
+    truncated is True when any list call returned a full page at DISCOVERY_ITEM_LIMIT,
+    meaning further items may exist. Callers should treat results as incomplete.
+    """
 
     issues: list[Issue]
     errors: list[str]
     owners_scanned: list[str]
+    truncated: bool = False
 
 
-ALLOWED_OWNERS = ["rmems", "Limen-Neural"]
-ALLOWED_OWNERS_SET = frozenset(ALLOWED_OWNERS)
+# Empty default — product must not hardcode org owners. Use WH_ALLOWED_OWNERS or
+# an explicit owners= argument for non-empty scans.
+ALLOWED_OWNERS: list[str] = []
+ALLOWED_OWNERS_SET: frozenset[str] = frozenset()
 
 
 class OwnerPolicyError(ValueError):
     """Raised when discovery is asked to scan a non-allowlisted owner without override."""
+
+
+def load_allowed_owners_from_env() -> list[str]:
+    """Parse WH_ALLOWED_OWNERS (comma-separated). Empty/unset → empty list."""
+    raw = os.environ.get(WH_ALLOWED_OWNERS_ENV, "")
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
 
 def _run_gh(args: list[str]) -> tuple[str, str, int]:
@@ -144,48 +165,116 @@ def _summarize_ci_rollup(rollup: Any) -> str | None:
     return "neutral"
 
 
+def _extract_label_names(data: dict[str, Any]) -> list[str]:
+    """Soft-extract label names; skip malformed entries."""
+    labels = data.get("labels") or []
+    if not isinstance(labels, list):
+        return []
+    names: list[str] = []
+    for label in labels:
+        if isinstance(label, dict) and "name" in label:
+            names.append(str(label["name"]))
+        elif isinstance(label, str):
+            names.append(label)
+    return names
+
+
+def _extract_assignee_logins(data: dict[str, Any]) -> list[str]:
+    """Soft-extract assignee logins; skip malformed entries."""
+    assignees = data.get("assignees") or []
+    if not isinstance(assignees, list):
+        return []
+    logins: list[str] = []
+    for assignee in assignees:
+        if isinstance(assignee, dict) and "login" in assignee:
+            logins.append(str(assignee["login"]))
+        elif isinstance(assignee, str):
+            logins.append(assignee)
+    return logins
+
+
 def _parse_issue(data: dict[str, Any], owner: str, repo: str) -> Issue:
-    """Parse a GitHub issue/PR JSON response into an Issue object."""
-    labels = [label["name"] for label in data.get("labels", [])]
+    """Parse a GitHub issue/PR JSON response into an Issue object.
+
+    Label/assignee extraction is soft; required field failures raise ValueError.
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"Issue data must be a dict, got {type(data).__name__}")
+
+    labels = _extract_label_names(data)
     milestone_data = data.get("milestone")
-    milestone = milestone_data.get("title") if milestone_data else None
-    assignees = [assignee["login"] for assignee in data.get("assignees", [])]
+    milestone: str | None
+    if isinstance(milestone_data, dict):
+        title = milestone_data.get("title")
+        milestone = str(title) if title is not None else None
+    else:
+        milestone = None
+    assignees = _extract_assignee_logins(data)
     ci_status = _summarize_ci_rollup(data.get("statusCheckRollup"))
 
     try:
-        return Issue(
-            number=data["number"],
-            title=data["title"],
-            state=data["state"].lower(),
-            labels=labels,
-            milestone=milestone,
-            url=data.get("url", data.get("html_url", "")),
-            owner=owner,
-            repo=repo,
-            is_pr="pullRequest" in data or data.get("pull_request") is not None,
-            assignees=assignees,
-            created_at=data["createdAt"] if "createdAt" in data else data.get("created_at", ""),
-            updated_at=data["updatedAt"] if "updatedAt" in data else data.get("updated_at", ""),
-            ci_status=ci_status,
-        )
+        number = data["number"]
+        title = data["title"]
+        state_raw = data["state"]
     except KeyError as e:
         raise ValueError(f"Missing required field in issue data: {e}") from e
+
+    return Issue(
+        number=int(number),
+        title=str(title),
+        state=str(state_raw).lower(),
+        labels=labels,
+        milestone=milestone,
+        url=str(data.get("url") or data.get("html_url") or ""),
+        owner=owner,
+        repo=repo,
+        is_pr="pullRequest" in data or data.get("pull_request") is not None,
+        assignees=assignees,
+        created_at=str(data["createdAt"] if "createdAt" in data else data.get("created_at", "")),
+        updated_at=str(data["updatedAt"] if "updatedAt" in data else data.get("updated_at", "")),
+        ci_status=ci_status,
+    )
+
+
+def _soft_parse_items(
+    data: list[Any],
+    owner: str,
+    repo: str,
+    *,
+    force_pr: bool = False,
+) -> tuple[list[Issue], list[str]]:
+    """Parse list items one-by-one; one bad item does not abort the repo scan."""
+    issues: list[Issue] = []
+    errors: list[str] = []
+    for idx, item in enumerate(data):
+        try:
+            if not isinstance(item, dict):
+                raise ValueError(f"expected object, got {type(item).__name__}")
+            issue = _parse_issue(item, owner, repo)
+            if force_pr:
+                issue = replace(issue, is_pr=True)
+            issues.append(issue)
+        except (ValueError, TypeError, KeyError) as e:
+            msg = f"Skipped malformed item #{idx} in {owner}/{repo}: {e}"
+            errors.append(msg)
+            logger.warning(msg)
+    return issues, errors
+
+
+def _hit_item_limit(data: list[Any]) -> bool:
+    """True when response length meets the soft fetch cap (possible silent truncation)."""
+    return len(data) >= DISCOVERY_ITEM_LIMIT
 
 
 def discover_issues_for_repo(
     owner: str,
     repo: str,
     state: IssueState = IssueState.OPEN,
-) -> tuple[list[Issue], str | None]:
+) -> tuple[list[Issue], str | None, bool]:
     """Discover issues for a specific repository.
 
-    Args:
-        owner: GitHub owner (org or user)
-        repo: Repository name
-        state: Filter by issue state
-
     Returns:
-        Tuple of (list of issues, error message or None)
+        Tuple of (issues, error_or_none, truncated)
     """
     args = [
         "issue",
@@ -204,33 +293,49 @@ def discover_issues_for_repo(
 
     if returncode != 0:
         if "Could not resolve to a Repository" in stderr:
-            return [], None  # Repo doesn't exist, skip silently
-        return [], f"Failed to query {owner}/{repo}: {stderr}"
+            return [], None, False
+        return [], f"Failed to query {owner}/{repo}: {stderr}", False
 
     try:
         data = json.loads(stdout)
-        issues = [_parse_issue(item, owner, repo) for item in data]
-        return issues, None
+        if not isinstance(data, list):
+            return [], f"Failed to parse JSON for {owner}/{repo}: expected list", False
+        issues, soft_errors = _soft_parse_items(data, owner, repo)
+        truncated = _hit_item_limit(data)
+        if truncated:
+            warn = (
+                f"Issue list for {owner}/{repo} hit DISCOVERY_ITEM_LIMIT "
+                f"({DISCOVERY_ITEM_LIMIT}); results may be incomplete"
+            )
+            soft_errors.append(warn)
+            logger.warning(warn)
+        # Soft parse errors are non-fatal; surface via error only if no issues and had soft errs
+        combined_error = (
+            "; ".join(soft_errors)
+            if soft_errors and not issues
+            else ("; ".join(soft_errors) if soft_errors else None)
+        )
+        # Always surface soft errors as warnings in the error channel when present
+        # alongside successful items so orchestrators can log them.
+        if soft_errors:
+            # Prefer returning issues + a single combined warning string
+            combined_error = "; ".join(soft_errors)
+        return issues, combined_error, truncated
     except json.JSONDecodeError as e:
-        return [], f"Failed to parse JSON for {owner}/{repo}: {e}"
+        return [], f"Failed to parse JSON for {owner}/{repo}: {e}", False
 
 
 def discover_pull_requests_for_repo(
     owner: str,
     repo: str,
     state: str = "open",
-) -> tuple[list[Issue], str | None]:
+) -> tuple[list[Issue], str | None, bool]:
     """Discover pull requests for a specific repository.
 
     Includes CI rollup (`statusCheckRollup`) when available from gh pr list.
 
-    Args:
-        owner: GitHub owner (org or user)
-        repo: Repository name
-        state: Filter by PR state (open, closed, all)
-
     Returns:
-        Tuple of (list of issues representing PRs, error message or None)
+        Tuple of (PRs as Issue objects, error_or_none, truncated)
     """
     args = [
         "pr",
@@ -249,29 +354,33 @@ def discover_pull_requests_for_repo(
 
     if returncode != 0:
         if "Could not resolve to a Repository" in stderr:
-            return [], None  # Repo doesn't exist, skip silently
-        return [], f"Failed to query PRs for {owner}/{repo}: {stderr}"
+            return [], None, False
+        return [], f"Failed to query PRs for {owner}/{repo}: {stderr}", False
 
     try:
         data = json.loads(stdout)
-        issues = []
-        for item in data:
-            issue = _parse_issue(item, owner, repo)
-            # PRs are always marked as PRs
-            issues.append(replace(issue, is_pr=True))
-        return issues, None
+        if not isinstance(data, list):
+            return [], f"Failed to parse JSON for PRs in {owner}/{repo}: expected list", False
+        issues, soft_errors = _soft_parse_items(data, owner, repo, force_pr=True)
+        truncated = _hit_item_limit(data)
+        if truncated:
+            warn = (
+                f"PR list for {owner}/{repo} hit DISCOVERY_ITEM_LIMIT "
+                f"({DISCOVERY_ITEM_LIMIT}); results may be incomplete"
+            )
+            soft_errors.append(warn)
+            logger.warning(warn)
+        combined_error = "; ".join(soft_errors) if soft_errors else None
+        return issues, combined_error, truncated
     except json.JSONDecodeError as e:
-        return [], f"Failed to parse JSON for PRs in {owner}/{repo}: {e}"
+        return [], f"Failed to parse JSON for PRs in {owner}/{repo}: {e}", False
 
 
-def list_repos_for_owner(owner: str) -> tuple[list[str], str | None]:
+def list_repos_for_owner(owner: str) -> tuple[list[str], str | None, bool]:
     """List repositories for a given owner.
 
-    Args:
-        owner: GitHub owner (org or user)
-
     Returns:
-        Tuple of (list of repo names, error message or None)
+        Tuple of (repo names, error_or_none, truncated)
     """
     args = [
         "repo",
@@ -286,18 +395,27 @@ def list_repos_for_owner(owner: str) -> tuple[list[str], str | None]:
     stdout, stderr, returncode = _run_gh(args)
 
     if returncode != 0:
-        return [], f"Failed to list repos for {owner}: {stderr}"
+        return [], f"Failed to list repos for {owner}: {stderr}", False
 
     try:
         data = json.loads(stdout)
-        repos = []
+        if not isinstance(data, list):
+            return [], f"Failed to parse JSON for repos of {owner}: expected list", False
+        repos: list[str] = []
         for item in data:
-            if "name" not in item:
+            if not isinstance(item, dict) or "name" not in item:
                 continue  # Skip malformed items
-            repos.append(item["name"])
-        return repos, None
+            repos.append(str(item["name"]))
+        truncated = _hit_item_limit(data)
+        if truncated:
+            logger.warning(
+                "Repo list for %s hit DISCOVERY_ITEM_LIMIT (%s); results may be incomplete",
+                owner,
+                DISCOVERY_ITEM_LIMIT,
+            )
+        return repos, None, truncated
     except json.JSONDecodeError as e:
-        return [], f"Failed to parse JSON for repos of {owner}: {e}"
+        return [], f"Failed to parse JSON for repos of {owner}: {e}", False
 
 
 def _resolve_owners(
@@ -307,18 +425,33 @@ def _resolve_owners(
 ) -> list[str]:
     """Resolve and validate the owner scan list.
 
-    Non-default owners require an explicit override flag (AGENTS.md scope rule).
+    Default allowlist is empty. Owners are resolved from:
+      1. Explicit ``owners=`` argument, or
+      2. ``WH_ALLOWED_OWNERS`` env (comma-separated).
+
+    When the env allowlist is non-empty, owners outside it require
+    ``allow_non_default_owners=True``. When the env allowlist is empty,
+    an explicit ``owners=`` list is required for a non-empty scan (passing
+    owners= is itself the operator-supplied list).
     """
+    allowed = load_allowed_owners_from_env()
+    allowed_set = frozenset(allowed)
+
     if owners is None:
-        return list(ALLOWED_OWNERS)
+        return list(allowed)
 
     resolved = list(owners)
-    disallowed = [o for o in resolved if o not in ALLOWED_OWNERS_SET]
+    if not allowed_set:
+        # Empty configured allowlist: explicit owners list is accepted as operator intent.
+        return resolved
+
+    disallowed = [o for o in resolved if o not in allowed_set]
     if disallowed and not allow_non_default_owners:
         raise OwnerPolicyError(
-            "Owner(s) not in default allowlist "
-            f"{sorted(ALLOWED_OWNERS_SET)}: {disallowed}. "
-            "Pass allow_non_default_owners=True for an explicit override."
+            "Owner(s) not in allowlist "
+            f"{sorted(allowed_set)}: {disallowed}. "
+            "Pass allow_non_default_owners=True for an explicit override, "
+            f"or set {WH_ALLOWED_OWNERS_ENV}."
         )
     return resolved
 
@@ -335,18 +468,19 @@ def discover_all(
     """Discover all eligible work across allowed owners.
 
     Args:
-        owners: List of GitHub owners to scan. Defaults to ALLOWED_OWNERS.
+        owners: List of GitHub owners to scan. Defaults to WH_ALLOWED_OWNERS
+            (empty when unset). Empty owners list yields an empty result.
         state: Filter by issue state
         include_prs: Whether to also discover pull requests (ignored if kind set)
         include_issues: Whether to discover issues (ignored if kind set)
         kind: High-level mode: "all" | "issues" | "prs". When set, overrides
             include_prs/include_issues for orchestrator kind=prs|issues|all.
         allow_non_default_owners: Explicit override to scan owners outside the
-            default allowlist (rmems, Limen-Neural).
+            configured WH_ALLOWED_OWNERS allowlist.
         check_auth: When True, fail fast if `gh auth status` is broken.
 
     Returns:
-        DiscoveryResult with all found issues and any errors
+        DiscoveryResult with all found issues, any errors, and truncated flag.
     """
     if kind == "prs":
         include_issues, include_prs = False, True
@@ -362,6 +496,7 @@ def discover_all(
 
     all_issues: list[Issue] = []
     all_errors: list[str] = []
+    any_truncated = False
 
     if check_auth:
         auth_error = ensure_gh_auth()
@@ -370,35 +505,53 @@ def discover_all(
                 issues=[],
                 errors=[auth_error],
                 owners_scanned=list(owners),
+                truncated=False,
             )
 
+    if not owners:
+        all_errors.append("No owners to scan: set WH_ALLOWED_OWNERS or pass owners= explicitly")
+        return DiscoveryResult(
+            issues=[],
+            errors=all_errors,
+            owners_scanned=[],
+            truncated=False,
+        )
+
     for owner in owners:
-        # List repos for this owner
-        repos, error = list_repos_for_owner(owner)
+        repos, error, repos_truncated = list_repos_for_owner(owner)
+        if repos_truncated:
+            any_truncated = True
+            all_errors.append(
+                f"Repo list for {owner} hit DISCOVERY_ITEM_LIMIT "
+                f"({DISCOVERY_ITEM_LIMIT}); results may be incomplete"
+            )
         if error:
             all_errors.append(error)
             continue
 
         for repo in repos:
             if include_issues:
-                issues, error = discover_issues_for_repo(owner, repo, state)
+                issues, error, truncated = discover_issues_for_repo(owner, repo, state)
+                if truncated:
+                    any_truncated = True
                 if error:
                     all_errors.append(error)
-                else:
-                    all_issues.extend(issues)
+                all_issues.extend(issues)
 
             if include_prs:
-                prs, error = discover_pull_requests_for_repo(owner, repo, state.value)
+                prs, error, truncated = discover_pull_requests_for_repo(owner, repo, state.value)
+                if truncated:
+                    any_truncated = True
                 if error:
                     all_errors.append(error)
-                else:
-                    all_issues.extend(prs)
+                all_issues.extend(prs)
 
     return DiscoveryResult(
         issues=all_issues,
         errors=all_errors,
-        # Copy so callers cannot mutate the module-level allowlist via the result.
+        # Copy so callers cannot mutate the resolved list via the result.
         owners_scanned=list(owners),
+        truncated=any_truncated,
     )
 
 
@@ -451,6 +604,7 @@ def format_for_orchestrator(result: DiscoveryResult) -> dict[str, Any]:
         "total_issues": len(result.issues),
         "total_errors": len(result.errors),
         "owners_scanned": list(result.owners_scanned),
+        "truncated": result.truncated,
         "issues": [
             {
                 "number": issue.number,
