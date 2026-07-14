@@ -399,10 +399,7 @@ mod tests {
         }
 
         let peak = supervisor.peak_active();
-        assert!(
-            peak <= 2,
-            "peak concurrency {peak} exceeded max_parallel=2"
-        );
+        assert!(peak <= 2, "peak concurrency {peak} exceeded max_parallel=2");
         assert_eq!(
             peak, 2,
             "expected peak concurrency to reach 2 with 3 overlapping tasks"
@@ -452,9 +449,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_failure_is_detectable() {
         let supervisor = Supervisor::new(1);
-        let output = supervisor
-            .run("wh-nonexistent-binary-xyz", &[], None)
-            .await;
+        let output = supervisor.run("wh-nonexistent-binary-xyz", &[], None).await;
         assert!(output.spawn_failed(), "stderr={}", output.stderr);
         assert!(output.exit_code.is_none());
     }
