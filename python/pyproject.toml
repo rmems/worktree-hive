@@ -18,7 +18,8 @@ dev = [
 ]
 
 [project.scripts]
-wh = "worktrees_hives.cli:main"
+worktrees-hives = "worktrees_hives.cli:main"
+wh-orch = "worktrees_hives.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/worktrees_hives"]
