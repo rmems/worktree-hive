@@ -354,9 +354,7 @@ class TestPolicyExitCode:
                 "error": None,
             }
         )
-        mock_run.return_value = MagicMock(
-            returncode=2, stdout=envelope, stderr="policy rejection"
-        )
+        mock_run.return_value = MagicMock(returncode=2, stdout=envelope, stderr="policy rejection")
         with pytest.raises(WhProcessError, match="exited with code 2"):
             WhClient().run("worktree", "create")
 
