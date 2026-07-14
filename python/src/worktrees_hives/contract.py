@@ -81,6 +81,13 @@ class Response:
                 raise WhSchemaError("'error.code' and 'error.message' must be strings")
             error = ErrorData(code=code, message=message)
 
+        # ok/error exclusivity: success envelopes must not carry error payloads;
+        # failure envelopes must include a structured error object.
+        if ok and error is not None:
+            raise WhSchemaError("'error' must be null when ok is true")
+        if not ok and error is None:
+            raise WhSchemaError("'error' is required when ok is false")
+
         return cls(
             ok=ok,
             schema_version=schema_version,

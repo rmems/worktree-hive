@@ -146,6 +146,28 @@ class TestResponseFromDict:
         with pytest.raises(WhSchemaError, match=r"'error\.code'"):
             Response.from_dict(self._valid_envelope(ok=False, error={"code": "E001"}))
 
+    def test_bool_schema_version_raises(self):
+        # bool is an int subclass; must still be rejected as schema_version.
+        with pytest.raises(WhSchemaError, match="'schema_version'"):
+            Response.from_dict(self._valid_envelope(schema_version=True))
+
+    def test_ok_true_with_error_raises(self):
+        with pytest.raises(WhSchemaError, match="'error' must be null when ok is true"):
+            Response.from_dict(
+                self._valid_envelope(
+                    ok=True,
+                    error={"code": "E001", "message": "should not appear on success"},
+                )
+            )
+
+    def test_ok_false_without_error_raises(self):
+        with pytest.raises(WhSchemaError, match="'error' is required when ok is false"):
+            Response.from_dict(self._valid_envelope(ok=False, error=None))
+
+    def test_unsupported_schema_version_raises(self):
+        with pytest.raises(WhSchemaError, match="Unsupported schema version"):
+            Response.from_dict(self._valid_envelope(schema_version=99))
+
 
 # ---------------------------------------------------------------------------
 # classify
@@ -317,3 +339,48 @@ class TestPolicyExitCode:
         with pytest.raises(PolicyError, match="PathEscape") as exc_info:
             WhClient().run("worktree", "create")
         assert exc_info.value.code == "PathEscape"
+
+    @patch("worktrees_hives.bridge.subprocess.run")
+    @patch("worktrees_hives.bridge._resolve_wh_binary", return_value="/usr/bin/wh")
+    def test_exit_2_schema_error_falls_back_to_process_error(self, mock_resolve, mock_run):
+        # ok=false without error is a schema violation; exit-2 path must not
+        # surface WhSchemaError — fall back to WhProcessError like #57.
+        envelope = json.dumps(
+            {
+                "ok": False,
+                "schema_version": 1,
+                "command": "worktree.create",
+                "data": {},
+                "error": None,
+            }
+        )
+        mock_run.return_value = MagicMock(
+            returncode=2, stdout=envelope, stderr="policy rejection"
+        )
+        with pytest.raises(WhProcessError, match="exited with code 2"):
+            WhClient().run("worktree", "create")
+
+    @patch("worktrees_hives.bridge.subprocess.run")
+    @patch("worktrees_hives.bridge._resolve_wh_binary", return_value="/usr/bin/wh")
+    def test_exit_2_invalid_json_falls_back_to_process_error(self, mock_resolve, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=2, stdout="not-json", stderr="policy rejection"
+        )
+        with pytest.raises(WhProcessError, match="exited with code 2"):
+            WhClient().run("worktree", "create")
+
+    @patch("worktrees_hives.bridge.subprocess.run")
+    @patch("worktrees_hives.bridge._resolve_wh_binary", return_value="/usr/bin/wh")
+    def test_exit_2_ok_true_with_error_falls_back_to_process_error(self, mock_resolve, mock_run):
+        envelope = json.dumps(
+            {
+                "ok": True,
+                "schema_version": 1,
+                "command": "worktree.create",
+                "data": {},
+                "error": {"code": "X", "message": "inconsistent"},
+            }
+        )
+        mock_run.return_value = MagicMock(returncode=2, stdout=envelope, stderr="policy")
+        with pytest.raises(WhProcessError, match="exited with code 2"):
+            WhClient().run("worktree", "create")

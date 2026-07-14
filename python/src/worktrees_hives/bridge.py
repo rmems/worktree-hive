@@ -25,6 +25,7 @@ from worktrees_hives.errors import (
     WhBinaryNotFoundError,
     WhJsonDecodeError,
     WhProcessError,
+    WhSchemaError,
 )
 
 
@@ -115,20 +116,25 @@ class WhClient:
             ) from exc
 
         if result.returncode != 0:
-            # Exit code 2 = policy violation — validate v1 envelope before PolicyError
+            # Exit code 2 = policy violation — validate v1 envelope before PolicyError.
+            # Malformed JSON or schema failures fall back to WhProcessError (same as #57).
             if result.returncode == 2 and result.stdout.strip():
                 try:
                     parsed = json.loads(result.stdout.strip())
                 except json.JSONDecodeError:
                     pass
                 else:
-                    response = Response.from_dict(parsed)
-                    classified = classify(response)
-                    if isinstance(classified, ErrorResponse):
-                        raise PolicyError(
-                            classified.error.code,
-                            classified.error.message,
-                        )
+                    try:
+                        response = Response.from_dict(parsed)
+                        classified = classify(response)
+                    except WhSchemaError:
+                        pass
+                    else:
+                        if isinstance(classified, ErrorResponse):
+                            raise PolicyError(
+                                classified.error.code,
+                                classified.error.message,
+                            )
 
             raise WhProcessError(
                 returncode=result.returncode,
