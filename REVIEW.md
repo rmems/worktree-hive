@@ -30,7 +30,7 @@ For stacked pull requests, review and fix the bottom PR before its children. Re-
 - [ ] Paths are derived under the configured worktree base and reject traversal or escape.
 - [ ] Agents edit only the assigned branch and isolated worktree.
 - [ ] Python limits each PR to three code-fix commits per babysit cycle.
-- [ ] Default owner scope remains `rmems/*` and `Limen-Neural/*` unless the operator explicitly overrides it.
+- [ ] Owner allowlist is configuration-only (env/API); no hard-coded personal/org defaults in product code or docs.
 - [ ] Credentials, tokens, and sensitive subprocess data are absent from logs and reports.
 
 ### Behavior and compatibility
