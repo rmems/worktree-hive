@@ -114,7 +114,7 @@ class ReplyTemplate:
             self.attribution_config,
             commit_sha=self.commit_sha,
         )
-        separator = "---\n" if self.is_thread_reply else "\n"
+        separator = "\n---\n" if self.is_thread_reply else "\n"
         placement = AttributionPlacement.coerce(self.attribution_config.placement)
 
         if placement == AttributionPlacement.HEADER:

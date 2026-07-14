@@ -112,13 +112,13 @@ class TestReplyTemplate:
     def test_thread_reply_footer(self) -> None:
         template = ReplyTemplate(body="Looks good!")
         result = template.render()
-        assert result == "Looks good!\n---\nworktrees-hives agent"
+        assert result == "Looks good!\n\n---\nworktrees-hives agent"
 
     def test_thread_reply_header(self) -> None:
         config = AttributionConfig(placement=AttributionPlacement.HEADER)
         template = ReplyTemplate(body="Looks good!", attribution_config=config)
         result = template.render()
-        assert result == "worktrees-hives agent\n---\nLooks good!"
+        assert result == "worktrees-hives agent\n\n---\nLooks good!"
 
     def test_pr_comment_footer(self) -> None:
         template = ReplyTemplate(body="All checks passed.", is_thread_reply=False)
@@ -141,7 +141,7 @@ class TestReplyTemplate:
             commit_sha="abc1234",
         )
         result = template.render()
-        assert result == "Fixed the issue.\n---\nworktrees-hives agent: fixed in abc1234"
+        assert result == "Fixed the issue.\n\n---\nworktrees-hives agent: fixed in abc1234"
 
     def test_with_commit_sha_header(self) -> None:
         config = AttributionConfig(placement=AttributionPlacement.HEADER)
@@ -151,7 +151,7 @@ class TestReplyTemplate:
             commit_sha="abc1234",
         )
         result = template.render()
-        assert result == "worktrees-hives agent: fixed in abc1234\n---\nFixed the issue."
+        assert result == "worktrees-hives agent: fixed in abc1234\n\n---\nFixed the issue."
 
     def test_frozen(self) -> None:
         template = ReplyTemplate(body="test")
@@ -164,16 +164,16 @@ class TestFormatReply:
 
     def test_defaults(self) -> None:
         result = format_reply("Looks good!")
-        assert result == "Looks good!\n---\nworktrees-hives agent"
+        assert result == "Looks good!\n\n---\nworktrees-hives agent"
 
     def test_with_config(self) -> None:
         config = AttributionConfig(agent_id="Custom Bot")
         result = format_reply("Looks good!", config=config)
-        assert result == "Looks good!\n---\nCustom Bot"
+        assert result == "Looks good!\n\n---\nCustom Bot"
 
     def test_with_commit_sha(self) -> None:
         result = format_reply("Fixed it.", commit_sha="abc1234")
-        assert result == "Fixed it.\n---\nworktrees-hives agent: fixed in abc1234"
+        assert result == "Fixed it.\n\n---\nworktrees-hives agent: fixed in abc1234"
 
     def test_pr_comment(self) -> None:
         result = format_reply("All done.", is_thread_reply=False)
@@ -187,10 +187,10 @@ class TestFormatReply:
             commit_sha="def5678",
             is_thread_reply=True,
         )
-        expected = "Resolved thread.\n---\nClaude Code: worktrees-hives agent: fixed in def5678"
+        expected = "Resolved thread.\n\n---\nClaude Code: worktrees-hives agent: fixed in def5678"
         assert result == expected
 
     def test_sha_always_included_when_provided(self) -> None:
         config = AttributionConfig(include_sha_on_fix=False)
         result = format_reply("Fixed.", config=config, commit_sha="abc1234")
-        assert result == "Fixed.\n---\nworktrees-hives agent: fixed in abc1234"
+        assert result == "Fixed.\n\n---\nworktrees-hives agent: fixed in abc1234"
