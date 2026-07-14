@@ -597,15 +597,24 @@ mod tests {
     }
 
     #[test]
-    fn supervised_exit_code_maps_timeout() {
-        let output = wh_core::supervisor::SupervisedOutput {
+    fn supervised_exit_code_maps_timeout_and_kill() {
+        let timed_out = wh_core::supervisor::SupervisedOutput {
             exit_code: None,
             timed_out: true,
+            killed: true,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        assert_eq!(supervised_exit_code(&timed_out), ExitCode::from(124));
+
+        let child_fail = wh_core::supervisor::SupervisedOutput {
+            exit_code: Some(7),
+            timed_out: false,
             killed: false,
             stdout: String::new(),
             stderr: String::new(),
         };
-        assert_eq!(supervised_exit_code(&output), ExitCode::from(124));
+        assert_eq!(supervised_exit_code(&child_fail), ExitCode::from(7));
     }
 
     #[tokio::test]

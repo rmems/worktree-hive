@@ -1,5 +1,16 @@
 //! Process supervisor with timeouts, process-group isolation, and max-parallel enforcement.
+//!
+//! # Platform notes
+//!
+//! On **Unix**, timeout and kill paths send `SIGKILL` to the entire process group
+//! (`kill(-pid, SIGKILL)` after spawning with `process_group(0)`), so descendants
+//! started by the child are cleaned up with the supervised process.
+//!
+//! On **Windows**, only the direct child process is killed via `child.kill()`.
+//! There is **no kill-tree**: grandchild processes may outlive the supervisor.
+//! Full Windows job-object / kill-tree support is not implemented yet.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -8,10 +19,13 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+/// How long to wait for the child to exit after a timeout kill.
+const POST_KILL_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Outcome of a supervised process execution.
 #[derive(Debug, Clone, Serialize)]
 pub struct SupervisedOutput {
-    /// Process exit code, or `None` if terminated by signal.
+    /// Process exit code, or `None` if terminated by signal / timeout / spawn failure.
     pub exit_code: Option<i32>,
     /// Whether the process was killed due to timeout.
     pub timed_out: bool,
@@ -39,6 +53,10 @@ impl SupervisedOutput {
 pub struct Supervisor {
     max_parallel: usize,
     semaphore: Semaphore,
+    /// Currently held permits (active supervised runs).
+    active: AtomicUsize,
+    /// High-water mark of concurrent supervised runs observed since construction.
+    peak_active: AtomicUsize,
 }
 
 impl Supervisor {
@@ -48,12 +66,24 @@ impl Supervisor {
         Self {
             max_parallel: permits,
             semaphore: Semaphore::new(permits),
+            active: AtomicUsize::new(0),
+            peak_active: AtomicUsize::new(0),
         }
     }
 
     /// Returns the configured max-parallel limit.
     pub fn max_parallel(&self) -> usize {
         self.max_parallel
+    }
+
+    /// Peak concurrent supervised runs observed (for tests / diagnostics).
+    pub fn peak_active(&self) -> usize {
+        self.peak_active.load(Ordering::SeqCst)
+    }
+
+    /// Current concurrent supervised runs.
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
     }
 
     /// Run a command under supervision.
@@ -73,6 +103,21 @@ impl Supervisor {
             .await
             .expect("supervisor semaphore closed");
 
+        let current = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_active.fetch_max(current, Ordering::SeqCst);
+
+        let output = self.run_with_permit(program, args, timeout).await;
+
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        output
+    }
+
+    async fn run_with_permit(
+        &self,
+        program: &str,
+        args: &[&str],
+        timeout: Option<Duration>,
+    ) -> SupervisedOutput {
         let mut cmd = Command::new(program);
         cmd.args(args);
         cmd.stdout(std::process::Stdio::piped());
@@ -114,10 +159,10 @@ impl Supervisor {
                 _ = &mut deadline => {
                     kill_process_group(pid);
                     let _ = child.kill().await;
-                    // Collect whatever partial output was captured before timeout.
-                    let stdout = stdout_handle.await.unwrap_or_default();
-                    let stderr = stderr_handle.await.unwrap_or_default();
-                    let _ = child.wait().await;
+                    // Bound how long we wait for the killed child and pipe readers.
+                    let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
+                    let stdout = join_with_timeout(stdout_handle).await;
+                    let stderr = join_with_timeout(stderr_handle).await;
                     SupervisedOutput {
                         exit_code: None,
                         timed_out: true,
@@ -157,6 +202,14 @@ impl Supervisor {
                 },
             }
         }
+    }
+}
+
+async fn join_with_timeout(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
+    match tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, handle).await {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(_)) => Vec::new(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -214,10 +267,15 @@ fn kill_process_group(pid: Option<u32>) {
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_pid: Option<u32>) {}
+fn kill_process_group(_pid: Option<u32>) {
+    // Windows: only the direct child is killed via `child.kill()` in the caller.
+    // Grandchildren are not reaped (no kill-tree / job object yet).
+}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     /// Portable shell invocation for tests (`sh -c` / `cmd /C`).
@@ -311,13 +369,45 @@ mod tests {
 
     #[tokio::test]
     async fn max_parallel_limits_concurrency() {
-        let supervisor = Supervisor::new(2);
-        let output = supervisor
-            .run(shell_program(), &[shell_flag(), "echo ok"], None)
-            .await;
+        let supervisor = Arc::new(Supervisor::new(2));
 
-        assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
-        assert_eq!(output.stdout.trim(), "ok");
+        #[cfg(windows)]
+        let script = "ping -n 2 127.0.0.1 >NUL";
+        #[cfg(not(windows))]
+        let script = "sleep 0.4";
+
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let s = Arc::clone(&supervisor);
+            handles.push(tokio::spawn(async move {
+                s.run(shell_program(), &[shell_flag(), script], None).await
+            }));
+        }
+
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.expect("join task"));
+        }
+
+        for (i, output) in results.iter().enumerate() {
+            assert_eq!(
+                output.exit_code,
+                Some(0),
+                "task {i} failed: stderr={}",
+                output.stderr
+            );
+        }
+
+        let peak = supervisor.peak_active();
+        assert!(
+            peak <= 2,
+            "peak concurrency {peak} exceeded max_parallel=2"
+        );
+        assert_eq!(
+            peak, 2,
+            "expected peak concurrency to reach 2 with 3 overlapping tasks"
+        );
+        assert_eq!(supervisor.active(), 0);
     }
 
     #[tokio::test]
@@ -357,5 +447,15 @@ mod tests {
         assert!(json.contains("\"timed_out\":true"), "{json}");
         assert!(json.contains("\"killed\":true"), "{json}");
         assert!(json.contains("\"exit_code\":null"), "{json}");
+    }
+
+    #[tokio::test]
+    async fn spawn_failure_is_detectable() {
+        let supervisor = Supervisor::new(1);
+        let output = supervisor
+            .run("wh-nonexistent-binary-xyz", &[], None)
+            .await;
+        assert!(output.spawn_failed(), "stderr={}", output.stderr);
+        assert!(output.exit_code.is_none());
     }
 }
