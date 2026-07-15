@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -21,30 +22,61 @@ enum Command {
     Status,
     /// List all watched jobs (alias for status).
     Jobs,
+    /// Validate and run a git command under safety policy.
+    GitSafe {
+        /// Optional expected branch; mutating subcommands verify before running.
+        #[arg(long)]
+        expected_branch: Option<String>,
+
+        /// Repository working tree (default: current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Git arguments after the subcommand (e.g., push --force-with-lease origin main).
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Validate and run a GitHub CLI command under safety policy.
+    GhSafe {
+        /// gh arguments (e.g., pr create --title "Fix").
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match run(cli, &mut io::stdout()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             let _ = writeln!(io::stderr(), "wh: {error}");
-            ExitCode::FAILURE
+            match &error {
+                wh_core::error::Error::PolicyViolation { .. } => ExitCode::from(2),
+                _ => ExitCode::FAILURE,
+            }
         }
     }
 }
 
 /// Entry point that loads watched state only for status/jobs subcommands.
-fn run(cli: Cli, stdout: &mut impl Write) -> io::Result<()> {
+fn run(cli: Cli, stdout: &mut impl Write) -> wh_core::error::Result<ExitCode> {
     match cli.command {
-        Some(cmd) => {
-            let command_name = match cmd {
-                Command::Status => "cli.status",
-                Command::Jobs => "cli.jobs",
-            };
-            run_status(cli.json, command_name, wh_core::state::load_jobs(), stdout)
+        Some(Command::Status) => {
+            run_status(cli.json, "cli.status", wh_core::state::load_jobs(), stdout)?;
+            Ok(ExitCode::SUCCESS)
         }
+        Some(Command::Jobs) => {
+            run_status(cli.json, "cli.jobs", wh_core::state::load_jobs(), stdout)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::GitSafe {
+            expected_branch,
+            repo,
+            args,
+        }) => run_git_safe(&args, expected_branch.as_deref(), repo, cli.json, stdout),
+        Some(Command::GhSafe { args }) => run_gh_safe(&args, cli.json, stdout),
         None => {
             if cli.json {
                 serde_json::to_writer(
@@ -54,7 +86,7 @@ fn run(cli: Cli, stdout: &mut impl Write) -> io::Result<()> {
                 .map_err(io::Error::other)?;
                 stdout.write_all(b"\n")?;
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
@@ -107,13 +139,92 @@ fn run_with_jobs(
     Ok(())
 }
 
+fn run_git_safe(
+    args: &[String],
+    expected_branch: Option<&str>,
+    repo: Option<PathBuf>,
+    json: bool,
+    stdout: &mut impl Write,
+) -> wh_core::error::Result<ExitCode> {
+    let cmd = wh_core::git_safe::SafeGitCommand::new(args)?;
+    let repo_dir = repo.unwrap_or_else(|| PathBuf::from("."));
+    let output = cmd.run(&repo_dir, expected_branch)?;
+
+    write_safe_result("git.safe", cmd.args(), &output, json, stdout)?;
+    Ok(exit_code_from_i32(output.exit_code))
+}
+
+fn run_gh_safe(
+    args: &[String],
+    json: bool,
+    stdout: &mut impl Write,
+) -> wh_core::error::Result<ExitCode> {
+    let cmd = wh_core::git_safe::SafeGhCommand::new(args)?;
+    let output = cmd.run()?;
+
+    write_safe_result("gh.safe", cmd.args(), &output, json, stdout)?;
+    Ok(exit_code_from_i32(output.exit_code))
+}
+
+fn write_safe_result(
+    command: &'static str,
+    args: &[String],
+    output: &wh_core::git_safe::GitOutput,
+    json: bool,
+    stdout: &mut impl Write,
+) -> wh_core::error::Result<()> {
+    if json {
+        let data = serde_json::json!({
+            "args": args,
+            "exit_code": output.exit_code,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+        });
+        let response = wh_core::contract::Response::success(command, data);
+        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+    } else {
+        // Human: show validation + execution summary; stream child stdout/stderr to stdout/stderr.
+        writeln!(
+            stdout,
+            "ran: {} {} (exit {})",
+            if command.starts_with("git") {
+                "git"
+            } else {
+                "gh"
+            },
+            args.join(" "),
+            output.exit_code
+        )?;
+        if !output.stdout.is_empty() {
+            write!(stdout, "{}", output.stdout)?;
+        }
+        if !output.stderr.is_empty() {
+            let _ = write!(io::stderr(), "{}", output.stderr);
+        }
+    }
+    Ok(())
+}
+
+fn exit_code_from_i32(code: i32) -> ExitCode {
+    if code == 0 {
+        ExitCode::SUCCESS
+    } else if (1..=255).contains(&code) {
+        ExitCode::from(code as u8)
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
+    use std::process::ExitCode;
     use std::str;
+
+    use clap::CommandFactory;
     use wh_core::status::{CiClass, JobStatus, ProcessState};
 
-    use super::{Cli, run_status, run_with_jobs};
+    use super::{Cli, run, run_status, run_with_jobs};
 
     fn sample_job() -> JobStatus {
         JobStatus {
@@ -146,7 +257,7 @@ mod tests {
         };
         let mut stdout = Vec::new();
 
-        super::run(cli, &mut stdout).unwrap();
+        run(cli, &mut stdout).unwrap();
 
         assert_eq!(
             str::from_utf8(&stdout).unwrap(),
@@ -162,7 +273,7 @@ mod tests {
         };
         let mut stdout = Vec::new();
 
-        super::run(cli, &mut stdout).unwrap();
+        run(cli, &mut stdout).unwrap();
 
         assert!(stdout.is_empty());
     }
@@ -325,5 +436,173 @@ mod tests {
             stdout.is_empty(),
             "human load error should not write a success summary to stdout"
         );
+    }
+
+    #[test]
+    fn git_safe_valid_command_executes() {
+        let cli = Cli {
+            json: false,
+            command: Some(super::Command::GitSafe {
+                expected_branch: None,
+                repo: None,
+                args: vec!["rev-parse".to_owned(), "--is-inside-work-tree".to_owned()],
+            }),
+        };
+        let mut stdout = Vec::new();
+
+        let code = run(cli, &mut stdout).unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+
+        let output = str::from_utf8(&stdout).unwrap();
+        assert!(output.contains("ran: git rev-parse --is-inside-work-tree"));
+        assert!(output.contains("true"));
+    }
+
+    #[test]
+    fn git_safe_json_mode_includes_exit_code() {
+        let cli = Cli {
+            json: true,
+            command: Some(super::Command::GitSafe {
+                expected_branch: None,
+                repo: None,
+                args: vec!["rev-parse".to_owned(), "--is-inside-work-tree".to_owned()],
+            }),
+        };
+        let mut stdout = Vec::new();
+
+        run(cli, &mut stdout).unwrap();
+
+        let output = str::from_utf8(&stdout).unwrap();
+        let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(v.get("command").and_then(|x| x.as_str()), Some("git.safe"));
+        let data = v.get("data").expect("data");
+        assert_eq!(data.get("exit_code").and_then(|x| x.as_i64()), Some(0));
+        assert!(
+            data.get("stdout")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .contains("true")
+        );
+    }
+
+    #[test]
+    fn git_safe_blocks_merge() {
+        let cli = Cli {
+            json: false,
+            command: Some(super::Command::GitSafe {
+                expected_branch: None,
+                repo: None,
+                args: vec!["merge".to_owned(), "feature".to_owned()],
+            }),
+        };
+        let mut stdout = Vec::new();
+
+        let err = run(cli, &mut stdout).unwrap_err();
+        assert!(matches!(
+            err,
+            wh_core::error::Error::PolicyViolation {
+                code: wh_core::error::PolicyCode::MergeBlocked,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn git_safe_blocks_bare_force() {
+        let cli = Cli {
+            json: false,
+            command: Some(super::Command::GitSafe {
+                expected_branch: None,
+                repo: None,
+                args: vec!["push".to_owned(), "--force".to_owned()],
+            }),
+        };
+        let mut stdout = Vec::new();
+
+        let err = run(cli, &mut stdout).unwrap_err();
+        assert!(matches!(
+            err,
+            wh_core::error::Error::PolicyViolation {
+                code: wh_core::error::PolicyCode::BareForcePush,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn git_safe_checkout_merge_branch_name_not_merge_blocked() {
+        // Subcommand-only merge detection: a branch argument named `merge` is fine.
+        // Policy-only check — do not execute checkout (would require a real ref / switch).
+        let cmd =
+            wh_core::git_safe::SafeGitCommand::new(&["checkout".to_owned(), "merge".to_owned()])
+                .expect("checkout of branch named merge must not be MergeBlocked");
+        assert_eq!(cmd.subcommand(), "checkout");
+        assert_eq!(cmd.args(), &["checkout", "merge"]);
+    }
+
+    #[test]
+    fn gh_safe_pr_merge_blocked() {
+        let cli = Cli {
+            json: false,
+            command: Some(super::Command::GhSafe {
+                args: vec!["pr".to_owned(), "merge".to_owned()],
+            }),
+        };
+        let mut stdout = Vec::new();
+
+        let err = run(cli, &mut stdout).unwrap_err();
+        assert!(matches!(
+            err,
+            wh_core::error::Error::PolicyViolation {
+                code: wh_core::error::PolicyCode::MergeBlocked,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gh_safe_api_blocked() {
+        let cli = Cli {
+            json: false,
+            command: Some(super::Command::GhSafe {
+                args: vec!["api".to_owned(), "repos/acme/example-org".to_owned()],
+            }),
+        };
+        let mut stdout = Vec::new();
+
+        let err = run(cli, &mut stdout).unwrap_err();
+        assert!(matches!(
+            err,
+            wh_core::error::Error::PolicyViolation {
+                code: wh_core::error::PolicyCode::GhSubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gh_safe_pr_view_allowed_at_policy() {
+        // May fail if gh is not auth'd; policy must accept `pr view`.
+        let cli = Cli {
+            json: true,
+            command: Some(super::Command::GhSafe {
+                args: vec!["pr".to_owned(), "view".to_owned(), "1".to_owned()],
+            }),
+        };
+        let mut stdout = Vec::new();
+        match run(cli, &mut stdout) {
+            Ok(_) => {
+                let output = str::from_utf8(&stdout).unwrap();
+                assert!(output.contains("\"command\":\"gh.safe\""));
+            }
+            Err(wh_core::error::Error::PolicyViolation { .. }) => {
+                panic!("pr view must pass policy")
+            }
+            Err(wh_core::error::Error::Io { .. }) => {
+                // gh binary missing is acceptable in constrained envs
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
     }
 }
