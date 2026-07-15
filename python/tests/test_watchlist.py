@@ -154,8 +154,9 @@ class TestMaxFixesOnLoad:
         )
         w = Watchlist(state_path)
         assert w.get("bad") is None
-        assert w.get("good") is not None
-        assert w.get("good") is not None and w.get("good").max_fixes == 2
+        good = w.get("good")
+        assert good is not None
+        assert good.max_fixes == 2
 
 
 class TestWatchlistRemove:
@@ -289,6 +290,79 @@ class TestOwnerAllowlist:
         w = Watchlist(state_path, allowed_owners=frozenset({"acme"}))
         with pytest.raises(PolicyError, match="not in allowed owners"):
             w.add("j1", "evil", "repo", "br")
+
+    def test_env_allowlist_filters_loaded_jobs(
+        self, state_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "jobs": {
+                        "good": {
+                            "job_id": "good",
+                            "owner": "acme",
+                            "repo": "repo",
+                            "branch": "br",
+                            "status": "pending",
+                            "max_fixes": 3,
+                            "fix_count": 0,
+                            "residual_blockers": [],
+                        },
+                        "bad": {
+                            "job_id": "bad",
+                            "owner": "evil",
+                            "repo": "repo",
+                            "branch": "br",
+                            "status": "pending",
+                            "max_fixes": 3,
+                            "fix_count": 0,
+                            "residual_blockers": [],
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme")
+
+        w = Watchlist(state_path)
+
+        assert w.get("good") is not None
+        assert w.get("bad") is None
+        assert [job.job_id for job in w.list_jobs()] == ["good"]
+        result = w.check()
+        assert [job.job_id for job in result["needs_pr"]] == ["good"]
+
+    def test_constructor_allowlist_filters_loaded_jobs(
+        self, state_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("WH_ALLOWED_OWNERS", raising=False)
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "jobs": {
+                        "bad": {
+                            "job_id": "bad",
+                            "owner": "evil",
+                            "repo": "repo",
+                            "branch": "br",
+                            "status": "pending",
+                            "max_fixes": 3,
+                            "fix_count": 0,
+                            "residual_blockers": [],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        w = Watchlist(state_path, allowed_owners=frozenset({"acme"}))
+
+        assert w.list_jobs() == []
+        assert all(not jobs for jobs in w.check().values())
 
     def test_load_allowed_owners_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme, example-org")

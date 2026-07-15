@@ -182,6 +182,11 @@ def _validate_max_fixes(max_fixes: int) -> int:
     return max_fixes
 
 
+def _owner_allowed(owner: str, allowed_owners: frozenset[str]) -> bool:
+    """Return whether owner is within the configured repository scope."""
+    return not allowed_owners or owner in allowed_owners
+
+
 class Watchlist:
     """Persistent watchlist for multi-job hive state.
 
@@ -237,6 +242,10 @@ class Watchlist:
                 if fix_count < 0:
                     continue
                 d["fix_count"] = fix_count
+                owner = str(d["owner"])
+                if not _owner_allowed(owner, self._allowed_owners):
+                    continue
+                d["owner"] = owner
                 jid = str(job_id)
                 self._jobs[jid] = JobState(**d)
                 if extras:
@@ -280,7 +289,7 @@ class Watchlist:
         owner is outside the configured allowlist.
         """
         max_fixes = _validate_max_fixes(max_fixes)
-        if self._allowed_owners and owner not in self._allowed_owners:
+        if not _owner_allowed(owner, self._allowed_owners):
             raise PolicyError(
                 f"Owner {owner!r} not in allowed owners: "
                 f"{sorted(self._allowed_owners)}. "
