@@ -65,7 +65,7 @@ enum SupervisorAction {
         max_parallel: usize,
 
         /// Command and arguments to run.
-        #[arg(required = true, trailing_var_arg = true)]
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
 }
