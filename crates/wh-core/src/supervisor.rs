@@ -12,6 +12,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::time::Instant;
 
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
@@ -151,31 +152,32 @@ impl Supervisor {
             tokio::spawn(async move { read_pipe(&mut child_stderr).await });
 
         if let Some(timeout) = timeout {
-            let deadline = tokio::time::sleep(timeout);
+            let deadline_at = Instant::now() + timeout;
+            let deadline = tokio::time::sleep_until(deadline_at);
             tokio::pin!(deadline);
 
             tokio::select! {
                 biased;
                 _ = &mut deadline => {
-                    kill_process_group(pid);
-                    let _ = child.kill().await;
-                    // Bound how long we wait for the killed child and pipe readers.
-                    let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
-                    let stdout = join_with_timeout(stdout_handle).await;
-                    let stderr = join_with_timeout(stderr_handle).await;
-                    SupervisedOutput {
-                        exit_code: None,
-                        timed_out: true,
-                        killed: true,
-                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                    }
+                    timeout_output(pid, &mut child, stdout_handle, stderr_handle).await
                 }
                 status = child.wait() => {
-                    let stdout = stdout_handle.await.unwrap_or_default();
-                    let stderr = stderr_handle.await.unwrap_or_default();
                     match status {
-                        Ok(s) => output_to_supervised(s, &stdout, &stderr),
+                        Ok(s) => {
+                            match drain_pipes_until(deadline_at, stdout_handle, stderr_handle).await {
+                                Ok((stdout, stderr)) => output_to_supervised(s, &stdout, &stderr),
+                                Err((stdout, stderr)) => {
+                                    kill_process_group(pid);
+                                    SupervisedOutput {
+                                        exit_code: None,
+                                        timed_out: true,
+                                        killed: true,
+                                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                                    }
+                                },
+                            }
+                        }
                         Err(e) => SupervisedOutput {
                             exit_code: None,
                             timed_out: false,
@@ -202,6 +204,44 @@ impl Supervisor {
                 },
             }
         }
+    }
+}
+
+async fn timeout_output(
+    pid: Option<u32>,
+    child: &mut tokio::process::Child,
+    stdout_handle: JoinHandle<Vec<u8>>,
+    stderr_handle: JoinHandle<Vec<u8>>,
+) -> SupervisedOutput {
+    kill_process_group(pid);
+    let _ = child.kill().await;
+    // Bound how long we wait for the killed child and pipe readers.
+    let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
+    let stdout = join_with_timeout(stdout_handle).await;
+    let stderr = join_with_timeout(stderr_handle).await;
+    SupervisedOutput {
+        exit_code: None,
+        timed_out: true,
+        killed: true,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    }
+}
+
+async fn drain_pipes_until(
+    deadline_at: Instant,
+    stdout_handle: JoinHandle<Vec<u8>>,
+    stderr_handle: JoinHandle<Vec<u8>>,
+) -> Result<(Vec<u8>, Vec<u8>), (Vec<u8>, Vec<u8>)> {
+    match tokio::time::timeout_at(deadline_at, async {
+        let stdout = stdout_handle.await.unwrap_or_default();
+        let stderr = stderr_handle.await.unwrap_or_default();
+        (stdout, stderr)
+    })
+    .await
+    {
+        Ok(output) => Ok(output),
+        Err(_) => Err((Vec::new(), Vec::new())),
     }
 }
 
@@ -349,6 +389,27 @@ mod tests {
         assert!(output.timed_out, "stderr={}", output.stderr);
         assert!(output.killed);
         assert!(output.exit_code.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_remains_active_while_draining_inherited_pipes() {
+        let supervisor = Supervisor::new(1);
+        let started = Instant::now();
+        let output = supervisor
+            .run(
+                shell_program(),
+                &[shell_flag(), "sleep 60 &"],
+                Some(Duration::from_millis(200)),
+            )
+            .await;
+
+        assert!(output.timed_out, "output={output:?}");
+        assert!(output.killed, "output={output:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "supervisor hung while draining inherited pipes"
+        );
     }
 
     #[tokio::test]

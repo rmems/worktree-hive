@@ -125,6 +125,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> wh_core::error::Result<ExitCo
                         .into());
                     }
                 };
+                enforce_supervisor_command_policy(program, &cmd[1..])?;
                 let args: Vec<&str> = cmd[1..].iter().map(|s| s.as_str()).collect();
                 let output = supervisor.run(program, &args, timeout).await;
 
@@ -170,6 +171,20 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> wh_core::error::Result<ExitCo
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Apply safety validation to supervised git and GitHub CLI commands before spawning.
+fn enforce_supervisor_command_policy(program: &str, args: &[String]) -> wh_core::error::Result<()> {
+    match program {
+        "git" => {
+            wh_core::git_safe::SafeGitCommand::new(args)?;
+        }
+        "gh" => {
+            wh_core::git_safe::SafeGhCommand::new(args)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Map supervised outcome to a process exit code.
@@ -559,6 +574,56 @@ mod tests {
         assert!(output.contains("test"));
         // Non-json path is raw SupervisedOutput, not the Response envelope.
         assert!(!output.contains("\"command\":\"supervisor.run\""));
+    }
+
+    #[tokio::test]
+    async fn supervisor_run_blocks_unsafe_git_command() {
+        let cli = Cli {
+            json: false,
+            command: Some(super::Command::Supervisor {
+                action: super::SupervisorAction::Run {
+                    timeout: 0,
+                    max_parallel: 4,
+                    cmd: vec!["git".to_owned(), "push".to_owned(), "--force".to_owned()],
+                },
+            }),
+        };
+        let mut stdout = Vec::new();
+
+        let err = run(cli, &mut stdout).await.unwrap_err();
+        assert!(matches!(
+            err,
+            wh_core::error::Error::PolicyViolation {
+                code: wh_core::error::PolicyCode::BareForcePush,
+                ..
+            }
+        ));
+        assert!(stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn supervisor_run_blocks_unsafe_gh_command() {
+        let cli = Cli {
+            json: false,
+            command: Some(super::Command::Supervisor {
+                action: super::SupervisorAction::Run {
+                    timeout: 0,
+                    max_parallel: 4,
+                    cmd: vec!["gh".to_owned(), "pr".to_owned(), "merge".to_owned()],
+                },
+            }),
+        };
+        let mut stdout = Vec::new();
+
+        let err = run(cli, &mut stdout).await.unwrap_err();
+        assert!(matches!(
+            err,
+            wh_core::error::Error::PolicyViolation {
+                code: wh_core::error::PolicyCode::MergeBlocked,
+                ..
+            }
+        ));
+        assert!(stdout.is_empty());
     }
 
     #[tokio::test]
