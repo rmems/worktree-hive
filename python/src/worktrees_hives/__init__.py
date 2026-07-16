@@ -1,4 +1,8 @@
-"""worktrees-hives: Python orchestrator for issue-to-PR and PR-babysit workflows."""
+"""worktrees-hives: Python orchestrator for issue-to-PR and PR-babysit workflows.
+
+Orchestration policy only. Worktrees, path sandbox, branch checks, and safe
+``git``/``gh`` execution belong to the Rust ``wh`` binary — use :class:`WhClient`.
+"""
 
 __version__ = "0.1.0"
 

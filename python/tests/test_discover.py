@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from worktrees_hives.contract import SuccessResponse
 from worktrees_hives.discover import (
     ALLOWED_OWNERS,
     DISCOVERY_ITEM_LIMIT,
@@ -15,6 +16,7 @@ from worktrees_hives.discover import (
     IssueState,
     OwnerPolicyError,
     _parse_issue,
+    _run_gh,
     discover_all,
     discover_issues_for_repo,
     discover_pull_requests_for_repo,
@@ -23,6 +25,7 @@ from worktrees_hives.discover import (
     list_repos_for_owner,
     load_allowed_owners_from_env,
 )
+from worktrees_hives.errors import PolicyError, WhBinaryNotFoundError
 
 
 @pytest.fixture
@@ -684,3 +687,40 @@ class TestCiRollup:
         }
         issue = _parse_issue(data, "acme", "repo")
         assert issue.ci_status == "success"
+
+
+class TestRunGhViaWh:
+    """_run_gh must use wh gh-safe, never spawn gh directly."""
+
+    def test_success_maps_child_fields(self) -> None:
+        client = MagicMock()
+        client.gh_safe.return_value = SuccessResponse(
+            command="gh.safe",
+            data={
+                "args": ["issue", "list"],
+                "exit_code": 0,
+                "stdout": "[]",
+                "stderr": "",
+            },
+            schema_version=1,
+        )
+        stdout, stderr, code = _run_gh(["issue", "list"], client=client)
+        assert (stdout, stderr, code) == ("[]", "", 0)
+        client.gh_safe.assert_called_once_with("issue", "list")
+
+    def test_policy_error_maps_to_exit_2(self) -> None:
+        client = MagicMock()
+        client.gh_safe.side_effect = PolicyError(
+            "SubcommandNotAllowed",
+            "gh subcommand `api` is not on the allowlist",
+        )
+        _stdout, stderr, code = _run_gh(["api", "repos"], client=client)
+        assert code == 2
+        assert "SubcommandNotAllowed" in stderr
+
+    def test_missing_wh_binary(self) -> None:
+        client = MagicMock()
+        client.gh_safe.side_effect = WhBinaryNotFoundError("wh not found")
+        _stdout, stderr, code = _run_gh(["auth", "status"], client=client)
+        assert code == 1
+        assert "wh not found" in stderr

@@ -3,8 +3,11 @@
 The bridge locates ``wh`` via ``WH_BIN`` (environment variable) or ``PATH``,
 invokes it with ``--json``, and parses the v1 JSON envelope on stdout.
 
-Python never duplicates Rust-owned safety checks — it delegates to ``wh`` and
-interprets the structured response.
+**Layering:** Python never invokes ``git`` or ``gh`` directly for hive jobs, and
+never reimplements Rust-owned safety, worktree, path, or branch checks. All
+mutating and safety-sensitive operations go through ``wh`` (``git-safe``,
+``gh-safe``, worktree, state, supervisor). This module is the only place Python
+spawns ``wh``.
 """
 
 from __future__ import annotations
@@ -85,14 +88,21 @@ class WhClient:
     def run(self, *args: str) -> SuccessResponse | ErrorResponse:
         """Invoke ``wh --json <args>`` and return a typed response envelope.
 
+        ``git-safe`` / ``gh-safe`` map the *child* exit code onto the process
+        exit while still writing an ``ok: true`` envelope with
+        ``data.exit_code``. Machine clients must read that envelope rather than
+        treating a non-zero process exit as a bridge failure.
+
         Raises
         ------
         WhBinaryNotFoundError
             If the ``wh`` binary cannot be located.
         WhProcessError
-            If ``wh`` exits with a non-zero status code.
+            If ``wh`` exits non-zero without a usable v1 envelope.
+        PolicyError
+            If ``wh`` exits 2 with a structured policy error envelope.
         WhJsonDecodeError
-            If stdout is not valid JSON.
+            If stdout is not valid JSON when an envelope was required.
         WhSchemaError
             If the decoded JSON does not match the v1 envelope.
         """
@@ -115,37 +125,64 @@ class WhClient:
                 stderr=f"wh timed out after {self._timeout}s",
             ) from exc
 
-        if result.returncode != 0:
-            # Exit code 2 = policy violation — validate v1 envelope before PolicyError.
-            # Malformed JSON or schema failures fall back to WhProcessError (same as #57).
-            if result.returncode == 2 and result.stdout.strip():
-                try:
-                    parsed = json.loads(result.stdout.strip())
-                except json.JSONDecodeError:
-                    pass
-                else:
-                    try:
-                        response = Response.from_dict(parsed)
-                        classified = classify(response)
-                    except WhSchemaError:
-                        pass
-                    else:
-                        if isinstance(classified, ErrorResponse):
-                            raise PolicyError(
-                                classified.error.code,
-                                classified.error.message,
-                            )
+        return self._interpret(result.returncode, result.stdout, result.stderr)
 
-            raise WhProcessError(
-                returncode=result.returncode,
-                stderr=result.stderr.strip(),
-            )
+    def gh_safe(self, *args: str) -> SuccessResponse | ErrorResponse:
+        """Run ``wh --json gh-safe <args>`` (Rust ``SafeGhCommand`` boundary)."""
+        return self.run("gh-safe", *args)
 
-        return self._parse(result.stdout)
+    def git_safe(
+        self, *args: str, expected_branch: str | None = None
+    ) -> SuccessResponse | ErrorResponse:
+        """Run ``wh --json git-safe …`` (Rust ``SafeGitCommand`` boundary)."""
+        flags: list[str] = []
+        if expected_branch is not None:
+            flags.extend(["--expected-branch", expected_branch])
+        return self.run("git-safe", *flags, *args)
 
     def bootstrap(self) -> SuccessResponse | ErrorResponse:
         """Run ``wh --json`` with no subcommand (bootstrap handshake)."""
         return self.run()
+
+    def _interpret(
+        self,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+    ) -> SuccessResponse | ErrorResponse:
+        """Map process exit + stdout to a typed envelope or raise."""
+        stripped = stdout.strip()
+
+        if stripped:
+            try:
+                classified = self._parse(stdout)
+            except (WhJsonDecodeError, WhSchemaError):
+                pass
+            else:
+                if isinstance(classified, ErrorResponse) and returncode == 2:
+                    raise PolicyError(
+                        classified.error.code,
+                        classified.error.message,
+                    )
+                # Success envelope — including gh-safe/git-safe child failures
+                # where process exit mirrors data.exit_code but ok is true.
+                # ErrorResponse on non-2 exits is returned as structured data.
+                return classified
+
+        if returncode == 2:
+            # Policy path without a usable envelope (same as #57).
+            raise WhProcessError(
+                returncode=returncode,
+                stderr=stderr.strip(),
+            )
+
+        if returncode != 0:
+            raise WhProcessError(
+                returncode=returncode,
+                stderr=stderr.strip(),
+            )
+
+        return self._parse(stdout)
 
     @staticmethod
     def _parse(raw_stdout: str) -> SuccessResponse | ErrorResponse:

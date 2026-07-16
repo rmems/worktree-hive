@@ -321,6 +321,81 @@ class TestWhClientRun:
         with pytest.raises(WhProcessError, match="timed out"):
             client.run()
 
+    @patch("worktrees_hives.bridge.subprocess.run")
+    @patch("worktrees_hives.bridge._resolve_wh_binary", return_value="/usr/bin/wh")
+    def test_child_exit_nonzero_with_ok_envelope_returns_success(self, mock_resolve, mock_run):
+        """gh-safe/git-safe: process exit mirrors child; envelope remains ok:true."""
+        envelope = json.dumps(
+            {
+                "ok": True,
+                "schema_version": 1,
+                "command": "gh.safe",
+                "data": {
+                    "args": ["auth", "status"],
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": "not logged in",
+                },
+                "error": None,
+            }
+        )
+        mock_run.return_value = MagicMock(returncode=1, stdout=envelope, stderr="")
+        result = WhClient().run("gh-safe", "auth", "status")
+        assert isinstance(result, SuccessResponse)
+        assert result.data["exit_code"] == 1
+        assert result.data["stderr"] == "not logged in"
+
+    @patch("worktrees_hives.bridge.subprocess.run")
+    @patch("worktrees_hives.bridge._resolve_wh_binary", return_value="/usr/bin/wh")
+    def test_gh_safe_helper_prefixes_subcommand(self, mock_resolve, mock_run):
+        envelope = json.dumps(
+            {
+                "ok": True,
+                "schema_version": 1,
+                "command": "gh.safe",
+                "data": {
+                    "args": ["issue", "list"],
+                    "exit_code": 0,
+                    "stdout": "[]",
+                    "stderr": "",
+                },
+                "error": None,
+            }
+        )
+        mock_run.return_value = MagicMock(returncode=0, stdout=envelope, stderr="")
+        WhClient().gh_safe("issue", "list")
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["/usr/bin/wh", "--json", "gh-safe", "issue", "list"]
+
+    @patch("worktrees_hives.bridge.subprocess.run")
+    @patch("worktrees_hives.bridge._resolve_wh_binary", return_value="/usr/bin/wh")
+    def test_git_safe_helper_expected_branch(self, mock_resolve, mock_run):
+        envelope = json.dumps(
+            {
+                "ok": True,
+                "schema_version": 1,
+                "command": "git.safe",
+                "data": {
+                    "args": ["status"],
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                },
+                "error": None,
+            }
+        )
+        mock_run.return_value = MagicMock(returncode=0, stdout=envelope, stderr="")
+        WhClient().git_safe("status", expected_branch="main")
+        cmd = mock_run.call_args[0][0]
+        assert cmd == [
+            "/usr/bin/wh",
+            "--json",
+            "git-safe",
+            "--expected-branch",
+            "main",
+            "status",
+        ]
+
 
 class TestPolicyExitCode:
     @patch("worktrees_hives.bridge.subprocess.run")
