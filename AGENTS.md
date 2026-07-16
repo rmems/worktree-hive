@@ -17,7 +17,7 @@ This file defines how coding agents contribute to `worktrees-hives` and how the 
 - **Limit code-fix commits** to three per PR per babysit cycle. Replies are unlimited.
 - **Process stacked PRs** from the bottom of the stack upward.
 - **Post review replies** only after pushing, and include the pushed SHA plus agent attribution.
-- **GitHub MCP first (non-negotiable for agents):** For PR status, CI check runs, review threads, issue reads, and PR comments on `rmems/*` / `Limen-Neural/*`, use the **GitHub MCP** (`github__pull_request_read`, list/comment tools, etc.). Do **not** default to shell `gh` for reads. Shell `gh` is allowed only when MCP is unavailable (e.g. 503) or for operations MCP cannot perform. Local `git` remains for branch/rebase/push.
+- **GitHub MCP first (non-negotiable for agents):** For PR status, CI check runs, review threads, issue reads, and PR comments, use the **GitHub MCP** (`github__pull_request_read`, list/comment tools, etc.). Do **not** default to shell `gh` for reads. Shell `gh` is allowed only when MCP is unavailable (e.g. 503) or for operations MCP cannot perform. Local `git` remains for branch/rebase/push. Do **not** hardcode org/owner names in product code or agent docs — owners come only from `WH_ALLOWED_OWNERS` / explicit API args.
 
 ### Deny-list (never execute)
 
@@ -202,7 +202,7 @@ The installable `SKILL.md` will own platform-facing prompts and command guidance
 7. After a pushed fix, the agent replies with SHA and attribution.
 8. The cycle ends when the PR is merge-ready or blocked. A human remains responsible for any merge.
 
-GitHub is the product issue source. Linear team `rmems` (`RM`) mirrors product planning. Beads tracks session claims, dependencies, and completion locally; it is not a replacement for GitHub product issues.
+GitHub is the product issue source. Linear may mirror product planning for the operator's team; that team id is operator-local, not a product default. Beads tracks session claims, dependencies, and completion locally; it is not a replacement for GitHub product issues.
 
 ## Runtime paths and overrides
 
