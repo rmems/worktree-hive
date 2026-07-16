@@ -273,6 +273,19 @@ class TestWatchlistFixCount:
         assert job.fix_count == 1
         assert job.fix_budget_remaining == 2
 
+    def test_per_pr_budget_shared_across_jobs(self, watchlist: Watchlist) -> None:
+        """Two job_ids on the same PR share the 3-fix ceiling for a cycle."""
+        watchlist.add("a", "acme", "repo", "br")
+        watchlist.add("b", "acme", "repo", "br")
+        watchlist.set_pr("a", 9, "https://example.com/pr/9")
+        watchlist.set_pr("b", 9, "https://example.com/pr/9")
+        watchlist.begin_babysit_cycle("c1")
+        watchlist.increment_fix_count("a", cycle_id="c1")
+        watchlist.increment_fix_count("b", cycle_id="c1")
+        watchlist.increment_fix_count("a", cycle_id="c1")
+        with pytest.raises(PolicyError, match=r"exhausted|PR"):
+            watchlist.increment_fix_count("b", cycle_id="c1")
+
     def test_exhaust_budget_raises(self, watchlist: Watchlist) -> None:
         watchlist.add("j1", "acme", "repo", "br", max_fixes=1)
         watchlist.increment_fix_count("j1")
@@ -325,6 +338,32 @@ class TestOwnerAllowlist:
         w = Watchlist(state_path, allowed_owners=frozenset({"acme"}))
         with pytest.raises(PolicyError, match="not in allowlist"):
             w.add("j1", "evil", "repo", "br")
+
+    def test_add_rejects_deferred_job_id_collision(self, state_path: Path) -> None:
+        """Disallowed-owner durable id must not be clobbered by a later add."""
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "jobs": {
+                        "j1": {
+                            "job_id": "j1",
+                            "owner": "evil",
+                            "repo": "repo",
+                            "branch": "br",
+                            "status": "pending",
+                            "max_fixes": 3,
+                            "fix_count": 0,
+                            "residual_blockers": [],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        w = Watchlist(state_path, allowed_owners=frozenset({"acme"}))
+        with pytest.raises(ValueError, match="already exists"):
+            w.add("j1", "acme", "other", "br")
 
     def test_env_allowlist_filters_loaded_jobs(
         self, state_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -766,3 +805,47 @@ class TestCliJsonEnvelopes:
         assert item["fix_count"] == 0
         assert item["max_fixes"] == 3
         assert item["fix_budget_remaining"] == 3
+
+    def test_json_add_includes_stack_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from worktrees_hives.cli import main
+
+        monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme")
+        state = str(tmp_path / "watchlist.json")
+        assert (
+            main(
+                [
+                    "--json",
+                    "--state",
+                    state,
+                    "watchlist",
+                    "add",
+                    "j1",
+                    "acme",
+                    "repo",
+                    "br",
+                    "--stack-id",
+                    "s1",
+                ]
+            )
+            == 0
+        )
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["data"]["job"]["stack_id"] == "s1"
+
+    def test_json_check_corrupt_uses_categories_shape(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from worktrees_hives.cli import main
+
+        monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme")
+        bad = tmp_path / "broken.json"
+        bad.write_text("{not-json", encoding="utf-8")
+        code = main(["--json", "--state", str(bad), "watchlist", "check"])
+        assert code == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert payload["command"] == "watchlist.check"
+        assert "categories" in payload["data"]
+        assert "jobs" not in payload["data"]

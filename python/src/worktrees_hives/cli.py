@@ -60,6 +60,7 @@ def _job_to_json(job: JobState) -> dict[str, Any]:
         "repo": job.repo,
         "branch": job.branch,
         "status": job.status.value,
+        "stack_id": job.stack_id,
         "pr_number": job.pr_number,
         "pr_url": job.pr_url,
         "fix_count": job.fix_count,
@@ -72,14 +73,19 @@ def _job_to_json(job: JobState) -> dict[str, Any]:
     }
 
 
+# Exact command → error data shape (avoid substring traps like "list" in "watchlist.check").
+_CORRUPT_DATA: dict[str, dict[str, object]] = {
+    "watchlist.add": {},
+    "watchlist.remove": {"job_id": None},
+    "watchlist.list": {"jobs": []},
+    "watchlist.check": {"categories": {}},
+}
+
+
 def _emit_corrupt(command: str, err: CorruptStateError, *, as_json: bool) -> int:
     print(f"Error: {err}", file=sys.stderr)
     if as_json:
-        empty: dict[str, object] = {"jobs": []} if "list" in command else {"categories": {}}
-        if "add" in command:
-            empty = {}
-        elif "remove" in command:
-            empty = {"job_id": None}
+        empty = _CORRUPT_DATA.get(command, {})
         print(
             json.dumps(
                 _v1_envelope(

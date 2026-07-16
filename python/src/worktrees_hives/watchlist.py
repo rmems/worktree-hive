@@ -109,12 +109,18 @@ def _env_nonempty(name: str) -> str | None:
 
 
 def _platform_data_dir() -> Path:
-    """Return a platform-aware user data directory for worktrees-hives."""
+    """Return a platform-aware user data directory for worktrees-hives.
+
+    Matches Rust ``wh-core`` paths.rs: Windows uses %APPDATA% (Roaming), not Local.
+    """
     if sys.platform == "win32":
-        base = _env_nonempty("LOCALAPPDATA")
+        base = _env_nonempty("APPDATA")
         if base:
             return Path(base) / "worktrees-hives"
-        return Path.home() / "AppData" / "Local" / "worktrees-hives"
+        profile = _env_nonempty("USERPROFILE")
+        if profile:
+            return Path(profile) / "AppData" / "Roaming" / "worktrees-hives"
+        return Path.home() / "AppData" / "Roaming" / "worktrees-hives"
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "worktrees-hives"
     # Linux / other Unix: XDG — empty XDG_DATA_HOME must not become Path('')/…
@@ -445,10 +451,8 @@ class Watchlist:
                 f"Owner {owner!r} not in allowlist ({hint})",
             )
         with self._locked():
-            if job_id in self._jobs:
+            if job_id in self._jobs or job_id in self._deferred_raw:
                 raise ValueError(f"Job {job_id!r} already exists in watchlist")
-            # Promoting a previously deferred id into active set.
-            self._deferred_raw.pop(job_id, None)
             job = JobState(
                 job_id=job_id,
                 owner=owner,
@@ -458,11 +462,18 @@ class Watchlist:
                 max_fixes=max_fixes,
             )
             self._jobs[job_id] = job
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                self._jobs.pop(job_id, None)
+                raise
             return job
 
     def remove(self, job_id: str) -> None:
         """Remove a job from the watchlist.
+
+        Removes active jobs, or deferred (disallowed/unparseable) records when
+        the operator explicitly names the job_id (recovery path; no second API).
 
         Raises KeyError if job_id not found.
         """
@@ -549,14 +560,36 @@ class Watchlist:
                 job.babysit_cycle = cycle_id
                 job.fix_count = 0
             effective_max = min(job.max_fixes, MAX_FIXES_CEILING)
-            if job.fix_count >= effective_max:
+            # AGENTS.md: cap is per PR per cycle — sum siblings sharing owner/repo/PR.
+            if job.pr_number is not None:
+                used = sum(
+                    j.fix_count
+                    for j in self._jobs.values()
+                    if j.owner == job.owner
+                    and j.repo == job.repo
+                    and j.pr_number == job.pr_number
+                    and j.babysit_cycle == job.babysit_cycle
+                )
+            else:
+                used = job.fix_count
+            if used >= effective_max:
                 raise PolicyError(
                     "FIX_BUDGET_EXHAUSTED",
                     f"Job {job_id!r} has exhausted its fix budget "
-                    f"({effective_max}; ceiling {MAX_FIXES_CEILING})",
+                    f"({effective_max}; ceiling {MAX_FIXES_CEILING}"
+                    + (
+                        f"; PR #{job.pr_number} cycle total {used}"
+                        if job.pr_number is not None
+                        else ""
+                    )
+                    + ")",
                 )
             job.fix_count += 1
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                job.fix_count -= 1
+                raise
             return job
 
     def set_blockers(self, job_id: str, blockers: list[str]) -> JobState:
