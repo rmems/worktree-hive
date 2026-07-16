@@ -60,9 +60,18 @@ enum SupervisorAction {
         #[arg(long, default_value = "0")]
         timeout: u64,
 
-        /// Maximum number of parallel processes.
+        /// Maximum concurrent supervised children **in this process only**.
+        /// Independent `wh` processes do not share this limit.
         #[arg(long, default_value = "8")]
         max_parallel: usize,
+
+        /// Expected git branch for mutating supervised `git` commands.
+        #[arg(long)]
+        expected_branch: Option<String>,
+
+        /// Repository working tree for supervised git branch checks (default: `.`).
+        #[arg(long)]
+        repo: Option<PathBuf>,
 
         /// Command and arguments to run.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -107,56 +116,20 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> wh_core::error::Result<ExitCo
             SupervisorAction::Run {
                 timeout,
                 max_parallel,
+                expected_branch,
+                repo,
                 cmd,
             } => {
-                let supervisor = wh_core::supervisor::Supervisor::new(max_parallel);
-                let timeout = if timeout == 0 {
-                    None
-                } else {
-                    Some(Duration::from_secs(timeout))
-                };
-                let program = match cmd.first() {
-                    Some(p) => p.as_str(),
-                    None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "supervisor run requires at least one argument (the command)",
-                        )
-                        .into());
-                    }
-                };
-                enforce_supervisor_command_policy(program, &cmd[1..])?;
-                let args: Vec<&str> = cmd[1..].iter().map(|s| s.as_str()).collect();
-                let output = supervisor.run(program, &args, timeout).await;
-
-                if cli.json {
-                    // Align with v1 Response envelope (typed data, structured error).
-                    let ok = !output.spawn_failed();
-                    let error = if output.spawn_failed() {
-                        Some(wh_core::contract::ErrorData {
-                            code: "SPAWN_FAILED".to_owned(),
-                            message: output.stderr.clone(),
-                        })
-                    } else {
-                        None
-                    };
-                    let data = serde_json::to_value(&output).map_err(io::Error::other)?;
-                    let response = wh_core::contract::Response {
-                        ok,
-                        schema_version: wh_core::contract::SCHEMA_VERSION,
-                        command: "supervisor.run",
-                        data,
-                        error,
-                    };
-                    serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
-                    stdout.write_all(b"\n")?;
-                } else {
-                    // Non-JSON: still emit machine-readable SupervisedOutput for piping.
-                    serde_json::to_writer(&mut *stdout, &output).map_err(io::Error::other)?;
-                    stdout.write_all(b"\n")?;
-                }
-
-                Ok(supervised_exit_code(&output))
+                run_supervisor(
+                    cli.json,
+                    timeout,
+                    max_parallel,
+                    expected_branch,
+                    repo,
+                    cmd,
+                    stdout,
+                )
+                .await
             }
         },
         None => {
@@ -173,17 +146,117 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> wh_core::error::Result<ExitCo
     }
 }
 
-/// Apply safety validation to supervised git and GitHub CLI commands before spawning.
-fn enforce_supervisor_command_policy(program: &str, args: &[String]) -> wh_core::error::Result<()> {
-    match program {
-        "git" => {
-            wh_core::git_safe::SafeGitCommand::new(args)?;
+/// Run `wh supervisor run` with policy-checked core supervisor and consistent JSON envelopes.
+async fn run_supervisor(
+    json: bool,
+    timeout_secs: u64,
+    max_parallel: usize,
+    expected_branch: Option<String>,
+    repo: Option<PathBuf>,
+    cmd: Vec<String>,
+    stdout: &mut impl Write,
+) -> wh_core::error::Result<ExitCode> {
+    let program = match cmd.first() {
+        Some(p) => p.as_str(),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "supervisor run requires at least one argument (the command)",
+            )
+            .into());
         }
-        "gh" => {
-            wh_core::git_safe::SafeGhCommand::new(args)?;
+    };
+    let args: Vec<&str> = cmd[1..].iter().map(|s| s.as_str()).collect();
+    let options = wh_core::supervisor::RunOptions {
+        expected_branch,
+        repo,
+    };
+    let timeout = if timeout_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(timeout_secs))
+    };
+
+    let supervisor = wh_core::supervisor::Supervisor::new(max_parallel);
+    match supervisor.run(program, &args, timeout, &options).await {
+        Ok(output) => {
+            write_supervisor_result(json, Ok(&output), stdout)?;
+            Ok(supervised_exit_code(&output))
         }
-        _ => {}
+        Err(err @ wh_core::error::Error::PolicyViolation { .. }) => {
+            write_supervisor_result(json, Err(&err), stdout)?;
+            Err(err)
+        }
+        Err(err) => Err(err),
     }
+}
+
+fn write_supervisor_result(
+    json: bool,
+    result: Result<&wh_core::supervisor::SupervisedOutput, &wh_core::error::Error>,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    if !json {
+        if let Ok(output) = result {
+            serde_json::to_writer(&mut *stdout, output).map_err(io::Error::other)?;
+            stdout.write_all(b"\n")?;
+        }
+        return Ok(());
+    }
+
+    let (ok, data, error) = match result {
+        Ok(output) => {
+            let data = serde_json::to_value(output).map_err(io::Error::other)?;
+            if output.succeeded() {
+                (true, data, None)
+            } else {
+                let code = output
+                    .error_code
+                    .and_then(|c| serde_json::to_value(c).ok())
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "SUPERVISOR_FAILED".to_owned());
+                let message = if output.stderr.is_empty() {
+                    format!(
+                        "supervised command failed (exit_code={:?})",
+                        output.exit_code
+                    )
+                } else {
+                    output.stderr.clone()
+                };
+                (
+                    false,
+                    data,
+                    Some(wh_core::contract::ErrorData { code, message }),
+                )
+            }
+        }
+        Err(wh_core::error::Error::PolicyViolation { code, message }) => (
+            false,
+            serde_json::json!({}),
+            Some(wh_core::contract::ErrorData {
+                code: code.as_str().to_owned(),
+                message: message.clone(),
+            }),
+        ),
+        Err(other) => (
+            false,
+            serde_json::json!({}),
+            Some(wh_core::contract::ErrorData {
+                code: "SUPERVISOR_ERROR".to_owned(),
+                message: other.to_string(),
+            }),
+        ),
+    };
+
+    let response = wh_core::contract::Response {
+        ok,
+        schema_version: wh_core::contract::SCHEMA_VERSION,
+        command: "supervisor.run",
+        data,
+        error,
+    };
+    serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+    stdout.write_all(b"\n")?;
     Ok(())
 }
 
@@ -560,7 +633,18 @@ mod tests {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
                     max_parallel: 4,
-                    cmd: vec!["echo".to_string(), "test".to_string()],
+                    expected_branch: None,
+                    repo: None,
+                    cmd: {
+                        #[cfg(windows)]
+                        {
+                            vec!["cmd".to_owned(), "/C".to_owned(), "echo test".to_owned()]
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            vec!["sh".to_owned(), "-c".to_owned(), "echo test".to_owned()]
+                        }
+                    },
                 },
             }),
         };
@@ -584,6 +668,8 @@ mod tests {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
                     max_parallel: 4,
+                    expected_branch: None,
+                    repo: None,
                     cmd: vec!["git".to_owned(), "push".to_owned(), "--force".to_owned()],
                 },
             }),
@@ -602,6 +688,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervisor_run_blocks_path_qualified_git_force() {
+        let cli = Cli {
+            json: true,
+            command: Some(super::Command::Supervisor {
+                action: super::SupervisorAction::Run {
+                    timeout: 0,
+                    max_parallel: 4,
+                    expected_branch: None,
+                    repo: None,
+                    cmd: vec![
+                        "/usr/bin/git".to_owned(),
+                        "push".to_owned(),
+                        "--force".to_owned(),
+                    ],
+                },
+            }),
+        };
+        let mut stdout = Vec::new();
+        let err = run(cli, &mut stdout).await.unwrap_err();
+        assert!(matches!(
+            err,
+            wh_core::error::Error::PolicyViolation {
+                code: wh_core::error::PolicyCode::BareForcePush,
+                ..
+            }
+        ));
+        let v: serde_json::Value =
+            serde_json::from_str(str::from_utf8(&stdout).unwrap().trim()).unwrap();
+        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(false));
+        assert_eq!(
+            v.get("command").and_then(|x| x.as_str()),
+            Some("supervisor.run")
+        );
+        assert_eq!(
+            v.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_str()),
+            Some("BARE_FORCE_PUSH")
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_run_json_nonzero_sets_ok_false() {
+        let cli = Cli {
+            json: true,
+            command: Some(super::Command::Supervisor {
+                action: super::SupervisorAction::Run {
+                    timeout: 0,
+                    max_parallel: 4,
+                    expected_branch: None,
+                    repo: None,
+                    cmd: {
+                        #[cfg(windows)]
+                        {
+                            vec!["cmd".to_owned(), "/C".to_owned(), "exit /B 7".to_owned()]
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            vec!["sh".to_owned(), "-c".to_owned(), "exit 7".to_owned()]
+                        }
+                    },
+                },
+            }),
+        };
+        let mut stdout = Vec::new();
+        let code = run(cli, &mut stdout).await.unwrap();
+        assert_eq!(code, ExitCode::from(7));
+        let v: serde_json::Value =
+            serde_json::from_str(str::from_utf8(&stdout).unwrap().trim()).unwrap();
+        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(false));
+        assert!(v.get("error").is_some());
+        assert_eq!(
+            v.get("data")
+                .and_then(|d| d.get("exit_code"))
+                .and_then(|c| c.as_i64()),
+            Some(7)
+        );
+    }
+
+    #[tokio::test]
     async fn supervisor_run_blocks_unsafe_gh_command() {
         let cli = Cli {
             json: false,
@@ -609,6 +775,8 @@ mod tests {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
                     max_parallel: 4,
+                    expected_branch: None,
+                    repo: None,
                     cmd: vec!["gh".to_owned(), "pr".to_owned(), "merge".to_owned()],
                 },
             }),
@@ -634,7 +802,18 @@ mod tests {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
                     max_parallel: 4,
-                    cmd: vec!["echo".to_string(), "test".to_string()],
+                    expected_branch: None,
+                    repo: None,
+                    cmd: {
+                        #[cfg(windows)]
+                        {
+                            vec!["cmd".to_owned(), "/C".to_owned(), "echo test".to_owned()]
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            vec!["sh".to_owned(), "-c".to_owned(), "echo test".to_owned()]
+                        }
+                    },
                 },
             }),
         };
@@ -669,6 +848,7 @@ mod tests {
             killed: true,
             stdout: String::new(),
             stderr: String::new(),
+            error_code: None,
         };
         assert_eq!(supervised_exit_code(&timed_out), ExitCode::from(124));
 
@@ -678,6 +858,7 @@ mod tests {
             killed: false,
             stdout: String::new(),
             stderr: String::new(),
+            error_code: None,
         };
         assert_eq!(supervised_exit_code(&child_fail), ExitCode::from(7));
     }
