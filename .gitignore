@@ -277,3 +277,11 @@ secrets.json
 .dolt/
 *.db
 .beads-credential-key
+
+# -----------------------------------------------------------------------------
+# Beads local DB/export (bd); keep on disk, do not commit
+# -----------------------------------------------------------------------------
+.beads/
+
+# Local/personal skill drafts (not product source)
+SKILL-grok-linear.md
