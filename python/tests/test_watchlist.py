@@ -640,7 +640,5 @@ class TestCheckEdgeCases:
     def test_io_error_on_directory_state(self, tmp_path: Path) -> None:
         d = tmp_path / "not-a-file"
         d.mkdir()
-        with pytest.raises(
-            CorruptStateError, match=r"Cannot read|Cannot write|Cannot create"
-        ):
+        with pytest.raises(CorruptStateError, match=r"Cannot read|Cannot write|Cannot create"):
             Watchlist(d, allowed_owners=_TEST_OWNERS)
