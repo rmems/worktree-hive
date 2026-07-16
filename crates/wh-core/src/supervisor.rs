@@ -529,6 +529,19 @@ fn prepare_supervised_command(
                                     .to_owned(),
                         })?;
                 let repo = resolve_supervised_repo(options.repo.as_deref())?;
+                // Bind `-R/--repo` to the verified local checkout so jobs cannot
+                // mutate a different GitHub repository after the branch gate.
+                if let Some(selector) = crate::git_safe::gh_repo_selector(&owned_args) {
+                    let local = crate::git_safe::origin_github_slug(&repo)?;
+                    if !crate::git_safe::github_repo_slugs_match(selector, &local) {
+                        return Err(Error::PolicyViolation {
+                            code: PolicyCode::PathNotAllowed,
+                            message: format!(
+                                "gh -R/--repo `{selector}` does not match verified origin `{local}`"
+                            ),
+                        });
+                    }
+                }
                 (
                     Some(repo.clone()),
                     Some(BranchCheck {
@@ -723,8 +736,9 @@ async fn timeout_output(
         killed: true,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        stdout_truncated: false,
-        stderr_truncated: false,
+        // Same capture-cap heuristic as successful completions / drain timeout path.
+        stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
+        stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
         error_code: Some(SupervisorErrorCode::TimedOut),
     }
 }

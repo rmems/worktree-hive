@@ -166,28 +166,68 @@ impl SafeGitCommand {
                         .to_owned(),
                 });
             }
-        }
-
-        if subcommand == "pull" {
-            let has_safe = args
-                .iter()
-                .any(|a| a == "--rebase" || a.starts_with("--rebase=") || a == "--ff-only");
-            if !has_safe {
+            // Remote ref deletion (`--delete` / `-d` / `:ref` refspecs).
+            if args.iter().any(|a| is_push_delete_flag(a))
+                || args.iter().skip(1).any(|a| is_delete_refspec(a))
+            {
                 return Err(Error::PolicyViolation {
-                    code: PolicyCode::MergeBlocked,
-                    message: "git pull requires --rebase or --ff-only under hive policy".to_owned(),
+                    code: PolicyCode::BareForcePush,
+                    message:
+                        "git push --delete / delete refspecs are not allowed under hive policy"
+                            .to_owned(),
                 });
             }
         }
 
-        if subcommand == "rebase"
-            && args
-                .iter()
-                .any(|a| a == "--exec" || a == "-x" || a.starts_with("--exec="))
-        {
+        if subcommand == "pull" && !pull_uses_safe_history_strategy(args) {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::MergeBlocked,
+                message: "git pull requires --rebase (not false) or --ff-only under hive policy"
+                    .to_owned(),
+            });
+        }
+
+        if subcommand == "rebase" && args.iter().any(|a| is_rebase_exec_option(a)) {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::SubcommandNotAllowed,
                 message: "git rebase --exec/-x is not allowed under hive policy".to_owned(),
+            });
+        }
+
+        // Transport helpers that run arbitrary local commands (`--receive-pack`, etc.).
+        if matches!(
+            subcommand.as_str(),
+            "push" | "pull" | "fetch" | "clone" | "ls-remote"
+        ) && args.iter().any(|a| is_remote_helper_exec_option(a))
+        {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                message: "git remote helper exec options (--receive-pack/--upload-pack/--exec) are not allowed"
+                    .to_owned(),
+            });
+        }
+
+        // Branch rename/copy leaves the worktree on a different branch name.
+        if subcommand == "branch"
+            && args
+                .iter()
+                .skip(1)
+                .any(|a| is_branch_rename_or_copy_flag(a))
+        {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::BranchMismatch,
+                message: "git branch rename/copy (-m/-M/-c/-C) is not allowed under hive policy"
+                    .to_owned(),
+            });
+        }
+
+        // Detach leaves HEAD off the assigned branch even when the target name matches.
+        if matches!(subcommand.as_str(), "checkout" | "switch")
+            && args.iter().skip(1).any(|a| is_detach_flag(subcommand, a))
+        {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::BranchMismatch,
+                message: "git checkout/switch --detach is not allowed under hive policy".to_owned(),
             });
         }
 
@@ -462,6 +502,16 @@ fn reject_external_write_targets(subcommand: &str, args: &[String]) -> Result<()
                         .to_owned(),
                 });
             }
+            if let Some(key) = config_key_name(args) {
+                if is_command_launching_config_key(key) {
+                    return Err(Error::PolicyViolation {
+                        code: PolicyCode::SubcommandNotAllowed,
+                        message: format!(
+                            "git config key `{key}` can launch external commands and is not allowed"
+                        ),
+                    });
+                }
+            }
             let mut i = 0;
             while i < args.len() {
                 let a = args[i].as_str();
@@ -502,6 +552,7 @@ const CLONE_VALUE_OPTS: &[&str] = &[
     "--reference",
     "--reference-if-able",
     "--separate-git-dir",
+    "--template",
     "--depth",
     "--shallow-since",
     "--shallow-exclude",
@@ -509,6 +560,9 @@ const CLONE_VALUE_OPTS: &[&str] = &[
     "-j",
     "--filter",
     "--recurse-submodules",
+    "--server-option",
+    "--bundle-uri",
+    "--revision",
 ];
 
 /// Destination directory of `git clone` after skipping option values, if present.
@@ -671,6 +725,278 @@ pub fn checkout_or_switch_target(args: &[String]) -> Option<&str> {
         return Some(a);
     }
     None
+}
+
+/// Whether `git pull` uses a non-merge history strategy.
+///
+/// Accepts bare `--rebase`, `--rebase=true|merges|interactive`, or `--ff-only`.
+/// Rejects `--rebase=false` and `--no-rebase` (merge-style pulls).
+fn pull_uses_safe_history_strategy(args: &[String]) -> bool {
+    if args.iter().any(|a| a == "--ff-only") {
+        return true;
+    }
+    if args.iter().any(|a| a == "--no-rebase") {
+        return false;
+    }
+    for a in args {
+        if a == "--rebase" {
+            return true;
+        }
+        if let Some(v) = a.strip_prefix("--rebase=") {
+            return matches!(v, "true" | "merges" | "interactive");
+        }
+    }
+    false
+}
+
+fn is_rebase_exec_option(arg: &str) -> bool {
+    arg == "--exec"
+        || arg == "-x"
+        || arg.starts_with("--exec=")
+        // Attached short form: `-xtrue` / `-x"cmd"`
+        || (arg.starts_with("-x") && arg.len() > 2 && !arg.starts_with("--"))
+}
+
+fn is_remote_helper_exec_option(arg: &str) -> bool {
+    matches!(arg, "--receive-pack" | "--upload-pack" | "--exec")
+        || arg.starts_with("--receive-pack=")
+        || arg.starts_with("--upload-pack=")
+        || arg.starts_with("--exec=")
+}
+
+fn is_push_delete_flag(arg: &str) -> bool {
+    if arg == "--delete" || arg == "-d" {
+        return true;
+    }
+    // Combined short clusters containing `d` (e.g. `-ud`) on push.
+    arg.starts_with('-')
+        && !arg.starts_with("--")
+        && arg.len() > 2
+        && arg.chars().skip(1).all(|c| c.is_ascii_alphanumeric())
+        && arg.chars().skip(1).any(|c| c == 'd')
+}
+
+fn is_delete_refspec(arg: &str) -> bool {
+    // Empty-source refspecs delete the destination: `:branch` or `+:branch`.
+    let s = arg.strip_prefix('+').unwrap_or(arg);
+    s.starts_with(':') && s.len() > 1
+}
+
+fn is_branch_rename_or_copy_flag(arg: &str) -> bool {
+    matches!(arg, "-m" | "-M" | "--move" | "-c" | "-C" | "--copy")
+}
+
+fn is_detach_flag(subcommand: &str, arg: &str) -> bool {
+    if arg == "--detach" || arg.starts_with("--detach=") {
+        return true;
+    }
+    // `git switch -d` is --detach; do not treat bare `-d` on checkout (unused/rare).
+    subcommand == "switch"
+        && (arg == "-d" || (arg.starts_with("-d") && arg.len() > 2 && !arg.starts_with("--")))
+}
+
+/// First config key name in `git config` args (after flags), if present.
+fn config_key_name(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            return args.get(i + 1).map(String::as_str);
+        }
+        if a.starts_with('-') {
+            if matches!(
+                a,
+                "-f" | "--file"
+                    | "--get"
+                    | "--get-all"
+                    | "--get-regexp"
+                    | "--unset"
+                    | "--unset-all"
+                    | "--replace-all"
+                    | "--add"
+                    | "--name-only"
+                    | "-l"
+                    | "--list"
+                    | "-e"
+                    | "--edit"
+                    | "--bool"
+                    | "--int"
+                    | "--bool-or-int"
+                    | "--path"
+                    | "--type"
+                    | "--default"
+                    | "--show-origin"
+                    | "--show-scope"
+                    | "--local"
+                    | "--worktree"
+                    | "--global"
+                    | "--system"
+                    | "-z"
+                    | "--null"
+                    | "-h"
+                    | "--help"
+            ) {
+                // value-taking flags
+                if matches!(a, "-f" | "--file" | "--type" | "--default") {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if let Some(rest) = a.strip_prefix("-f") {
+                if !rest.is_empty() && !rest.starts_with('-') {
+                    i += 1;
+                    continue;
+                }
+            }
+            if a.starts_with("--file=") || a.starts_with("--type=") || a.starts_with("--default=") {
+                i += 1;
+                continue;
+            }
+            // Unknown flag: skip token only.
+            i += 1;
+            continue;
+        }
+        return Some(a);
+    }
+    None
+}
+
+fn is_command_launching_config_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    if k.starts_with("alias.") || k.starts_with("filter.") || k.contains(".cmd") {
+        return true;
+    }
+    matches!(
+        k.as_str(),
+        "core.sshcommand"
+            | "core.editor"
+            | "core.pager"
+            | "core.askpass"
+            | "core.fsmonitor"
+            | "core.hookspath"
+            | "sequence.editor"
+            | "gpg.program"
+            | "diff.external"
+            | "diff.tool"
+            | "merge.tool"
+            | "credential.helper"
+            | "uploadpack.packobjectshook"
+            | "trace2.eventtarget"
+            | "trace2.normaltarget"
+            | "trace2.perftarget"
+    )
+}
+
+/// Extract `-R` / `--repo` / `--repo=` selector from a `gh` argv (including `pr` etc.).
+#[must_use]
+pub fn gh_repo_selector(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            break;
+        }
+        if a == "-R" || a == "--repo" {
+            return args.get(i + 1).map(String::as_str);
+        }
+        if let Some(v) = a.strip_prefix("--repo=") {
+            return Some(v);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Normalize a GitHub repo selector or remote URL to `owner/repo` (lowercase).
+#[must_use]
+pub fn normalize_github_repo_slug(spec: &str) -> Option<String> {
+    let mut s = spec.trim().trim_end_matches('/').to_owned();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(rest) = s.strip_suffix(".git") {
+        s = rest.to_owned();
+    }
+    // scp-like: git@host:owner/repo
+    if let Some(at) = s.find('@') {
+        if let Some(colon) = s[at..].find(':') {
+            let after = &s[at + colon + 1..];
+            if after.contains('/') && !after.contains("://") {
+                s = after.to_owned();
+            }
+        }
+    }
+    for prefix in ["https://", "http://", "ssh://", "git://"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.to_owned();
+            break;
+        }
+    }
+    // Drop userinfo in URL path form user@host/owner/repo (rare after scp rewrite)
+    if let Some(at) = s.find('@') {
+        if !s[..at].contains('/') {
+            s = s[at + 1..].to_owned();
+        }
+    }
+    let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
+    let (owner, repo) = match parts.as_slice() {
+        [owner, repo] => (*owner, *repo),
+        [host, owner, repo] => {
+            let _ = host;
+            (*owner, *repo)
+        }
+        [host, _port_or_user, owner, repo] => {
+            let _ = host;
+            (*owner, *repo)
+        }
+        _ => return None,
+    };
+    // host may include :port in first part for ssh://host:22/owner/repo — handled by 4-part match
+    let owner = owner.split(':').next().unwrap_or(owner);
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}/{}",
+        owner.to_ascii_lowercase(),
+        repo.to_ascii_lowercase()
+    ))
+}
+
+/// Whether two GitHub repo selectors refer to the same owner/repo.
+#[must_use]
+pub fn github_repo_slugs_match(a: &str, b: &str) -> bool {
+    match (normalize_github_repo_slug(a), normalize_github_repo_slug(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Resolve `origin` remote URL for a repo and return `owner/repo` if parseable.
+pub fn origin_github_slug(repo_dir: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .map_err(|e| Error::Io {
+            context: "resolve origin remote",
+            source: e,
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::GitDirUnavailable,
+            message: format!("failed to resolve origin remote: {}", stderr.trim()),
+        });
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    normalize_github_repo_slug(&url).ok_or_else(|| Error::PolicyViolation {
+        code: PolicyCode::GitDirUnavailable,
+        message: format!("could not parse origin remote as GitHub owner/repo: {url}"),
+    })
 }
 
 fn is_merge_subcommand(subcommand: &str) -> bool {
@@ -1027,6 +1353,191 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn pull_rebase_false_rejected() {
+        let err = SafeGitCommand::new(&[
+            "pull".to_owned(),
+            "--rebase=false".to_owned(),
+            "origin".to_owned(),
+            "main".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::MergeBlocked,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pull_rebase_true_allowed() {
+        SafeGitCommand::new(&[
+            "pull".to_owned(),
+            "--rebase=true".to_owned(),
+            "origin".to_owned(),
+            "main".to_owned(),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn rebase_attached_exec_rejected() {
+        let err =
+            SafeGitCommand::new(&["rebase".to_owned(), "-xtrue".to_owned(), "main".to_owned()])
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn clone_template_opt_still_rejects_abs_dest() {
+        let err = SafeGitCommand::new(&[
+            "clone".to_owned(),
+            "--template".to_owned(),
+            "/tmp/t".to_owned(),
+            "https://example.com/r.git".to_owned(),
+            "/tmp/outside".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn config_ssh_command_rejected() {
+        let err = SafeGitCommand::new(&[
+            "config".to_owned(),
+            "core.sshCommand".to_owned(),
+            "sh -c true".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn push_delete_rejected() {
+        let err = SafeGitCommand::new(&[
+            "push".to_owned(),
+            "--delete".to_owned(),
+            "origin".to_owned(),
+            "main".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::BareForcePush,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn push_delete_refspec_rejected() {
+        let err =
+            SafeGitCommand::new(&["push".to_owned(), "origin".to_owned(), ":main".to_owned()])
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::BareForcePush,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn push_receive_pack_rejected() {
+        let err = SafeGitCommand::new(&[
+            "push".to_owned(),
+            "--receive-pack=sh".to_owned(),
+            "origin".to_owned(),
+            "HEAD".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn checkout_detach_rejected() {
+        let err = SafeGitCommand::new(&[
+            "checkout".to_owned(),
+            "--detach".to_owned(),
+            "feature".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::BranchMismatch,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn branch_rename_rejected() {
+        let err = SafeGitCommand::new(&["branch".to_owned(), "-m".to_owned(), "main".to_owned()])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::BranchMismatch,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gh_repo_selector_extracts_r_flag() {
+        let args = vec![
+            "pr".to_owned(),
+            "-R".to_owned(),
+            "other/repo".to_owned(),
+            "close".to_owned(),
+            "1".to_owned(),
+        ];
+        assert_eq!(gh_repo_selector(&args), Some("other/repo"));
+    }
+
+    #[test]
+    fn github_slug_normalize_and_match() {
+        assert_eq!(
+            normalize_github_repo_slug("https://github.com/Acme/Repo.git").as_deref(),
+            Some("acme/repo")
+        );
+        assert_eq!(
+            normalize_github_repo_slug("git@github.com:Acme/Repo.git").as_deref(),
+            Some("acme/repo")
+        );
+        assert!(github_repo_slugs_match("Acme/Repo", "github.com/acme/repo"));
+        assert!(!github_repo_slugs_match("Acme/Repo", "other/repo"));
     }
 
     #[test]
