@@ -50,6 +50,45 @@ enum Command {
         #[command(subcommand)]
         action: SupervisorAction,
     },
+
+    /// Isolated git worktree lifecycle (create/list/remove/prune).
+    Worktree {
+        #[command(subcommand)]
+        action: WorktreeAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorktreeAction {
+    /// Create a worktree for a hive job under the sandboxed base path.
+    Create {
+        /// Repository root (git dir / working tree).
+        #[arg(long)]
+        repo: PathBuf,
+        /// GitHub-style owner segment.
+        owner: String,
+        /// Repository name segment.
+        repo_name: String,
+        /// Job id segment (e.g. gh-42).
+        job_id: String,
+        /// Branch name for the worktree.
+        branch: String,
+    },
+    /// List hive worktrees under the configured base.
+    List,
+    /// Remove a worktree path (must stay under the sandbox base).
+    Remove {
+        /// Absolute or relative worktree path.
+        path: PathBuf,
+        /// Force removal with dirty tree.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Prune stale git worktree metadata for a repo.
+    Prune {
+        #[arg(long)]
+        repo: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -95,7 +134,86 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor).
+fn run_worktree(
+    action: WorktreeAction,
+    json: bool,
+    stdout: &mut impl Write,
+) -> wh_core::error::Result<ExitCode> {
+    use wh_core::contract::Response;
+    use wh_core::worktree::WorktreeManager;
+
+    let response = match action {
+        WorktreeAction::Create {
+            repo,
+            owner,
+            repo_name,
+            job_id,
+            branch,
+        } => {
+            let manager = WorktreeManager::new()?;
+            let wt = manager.create(&repo, &owner, &repo_name, &job_id, &branch)?;
+            Response {
+                ok: true,
+                schema_version: wh_core::contract::SCHEMA_VERSION,
+                command: "worktree.create",
+                data: serde_json::json!({
+                    "path": wt.path,
+                    "branch": wt.branch,
+                    "repo_root": wt.repo_root,
+                }),
+                error: None,
+            }
+        }
+        WorktreeAction::List => {
+            let manager = WorktreeManager::new()?;
+            let worktrees = manager.list()?;
+            Response {
+                ok: true,
+                schema_version: wh_core::contract::SCHEMA_VERSION,
+                command: "worktree.list",
+                data: serde_json::json!({
+                    "worktrees": worktrees.iter().map(|wt| serde_json::json!({
+                        "path": wt.path,
+                        "branch": wt.branch,
+                    })).collect::<Vec<_>>(),
+                }),
+                error: None,
+            }
+        }
+        WorktreeAction::Remove { path, force } => {
+            let manager = WorktreeManager::new()?;
+            manager.remove(&path, force)?;
+            Response {
+                ok: true,
+                schema_version: wh_core::contract::SCHEMA_VERSION,
+                command: "worktree.remove",
+                data: serde_json::json!({ "removed": path }),
+                error: None,
+            }
+        }
+        WorktreeAction::Prune { repo } => {
+            let manager = WorktreeManager::new()?;
+            manager.prune(&repo)?;
+            Response {
+                ok: true,
+                schema_version: wh_core::contract::SCHEMA_VERSION,
+                command: "worktree.prune",
+                data: serde_json::json!({}),
+                error: None,
+            }
+        }
+    };
+
+    if json {
+        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+    } else {
+        writeln!(stdout, "ok={} command={}", response.ok, response.command)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).
 async fn run(cli: Cli, stdout: &mut impl Write) -> wh_core::error::Result<ExitCode> {
     match cli.command {
         Some(Command::Status) => {
@@ -132,6 +250,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> wh_core::error::Result<ExitCo
                 .await
             }
         },
+        Some(Command::Worktree { action }) => run_worktree(action, cli.json, stdout),
         None => {
             if cli.json {
                 serde_json::to_writer(

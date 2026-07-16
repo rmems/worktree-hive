@@ -153,3 +153,49 @@ mod tests {
         );
     }
 }
+
+const WORKTREE_BASE_ENV: &str = "WH_WORKTREE_BASE";
+
+/// Resolve the configured worktree base path.
+///
+/// Uses `WH_WORKTREE_BASE` when set, otherwise
+/// `{user_data_dir}/worktrees-hives/worktrees`.
+pub fn worktree_base_path() -> crate::error::Result<PathBuf> {
+    if let Some(value) = std::env::var_os(WORKTREE_BASE_ENV).filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(value));
+    }
+    Ok(user_data_dir().join("worktrees-hives").join("worktrees"))
+}
+
+/// Derive a sandboxed worktree path: `{base}/{owner}/{repo}/{job_id}`.
+pub fn derive_worktree_path(
+    base: &Path,
+    owner: &str,
+    repo: &str,
+    job_id: &str,
+) -> crate::error::Result<PathBuf> {
+    validate_path_segment("owner", owner)?;
+    validate_path_segment("repo", repo)?;
+    validate_path_segment("job_id", job_id)?;
+    Ok(base.join(owner).join(repo).join(job_id))
+}
+
+fn validate_path_segment(field: &'static str, value: &str) -> crate::error::Result<()> {
+    use crate::error::Error;
+    let invalid = value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.chars().any(std::path::is_separator)
+        || Path::new(value).components().count() != 1
+        || !matches!(
+            Path::new(value).components().next(),
+            Some(std::path::Component::Normal(s)) if s == value
+        );
+    if invalid {
+        return Err(Error::InvalidSegment {
+            field,
+            value: value.to_owned(),
+        });
+    }
+    Ok(())
+}
