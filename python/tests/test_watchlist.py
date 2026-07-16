@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -18,9 +19,6 @@ from worktrees_hives.watchlist import (
     _default_state_path,
     load_allowed_owners_from_env,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 # Explicit test allowlist (module deny-by-default when empty).
 _TEST_OWNERS = frozenset({"acme", "example-org", "other-owner"})
@@ -79,6 +77,19 @@ class TestDefaultStatePath:
         path = _default_state_path()
         assert path.name == "watchlist.json"
         assert path != tmp_path / "rust-watched.json"
+
+    def test_empty_xdg_data_home_falls_back_to_home(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Empty XDG_DATA_HOME must not resolve to CWD-relative worktrees-hives/."""
+        monkeypatch.delenv("WH_WATCHLIST_PATH", raising=False)
+        monkeypatch.setenv("XDG_DATA_HOME", "")
+        path = _default_state_path()
+        assert path.is_absolute()
+        assert path.name == "watchlist.json"
+        # Must not be Path('') / 'worktrees-hives' / 'watchlist.json' (cwd-relative).
+        assert path != Path("worktrees-hives") / "watchlist.json"
+        assert path.parent.name == "worktrees-hives"
+        if sys.platform not in {"win32", "darwin"}:
+            assert path.parent == Path.home() / ".local" / "share" / "worktrees-hives"
 
     def test_default_filename_is_watchlist_json(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -664,6 +675,25 @@ class TestCheckEdgeCases:
         )
         with pytest.raises(CorruptStateError, match="Unsupported"):
             Watchlist(state_path, allowed_owners=_TEST_OWNERS)
+
+    def test_malformed_jobs_array_raises(self, state_path: Path) -> None:
+        """jobs: [] must not be normalized to {} (would wipe durable data on save)."""
+        state_path.write_text(
+            json.dumps({"schema_version": 1, "jobs": []}),
+            encoding="utf-8",
+        )
+        with pytest.raises(CorruptStateError, match="Malformed jobs"):
+            Watchlist(state_path, allowed_owners=_TEST_OWNERS)
+
+    def test_concurrent_adds_preserve_both_jobs(self, state_path: Path) -> None:
+        """Two processes adding different jobs must not drop the earlier write."""
+        w1 = Watchlist(state_path, allowed_owners=_TEST_OWNERS)
+        w2 = Watchlist(state_path, allowed_owners=_TEST_OWNERS)
+        w1.add("j1", "acme", "r1", "br")
+        w2.add("j2", "acme", "r2", "br")
+        reloaded = Watchlist(state_path, allowed_owners=_TEST_OWNERS)
+        ids = {j.job_id for j in reloaded.list_jobs()}
+        assert ids == {"j1", "j2"}
 
     def test_io_error_on_directory_state(self, tmp_path: Path) -> None:
         d = tmp_path / "not-a-file"

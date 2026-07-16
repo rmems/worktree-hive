@@ -11,10 +11,12 @@ import time
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from worktrees_hives.errors import PolicyError
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 # Python orchestrator watchlist store (separate from Rust `watched.json`).
 # Rust `wh status`/`wh jobs` expect a JSON *array* of JobStatus at WH_STATE_PATH/
 # watched.json (see crates/wh-core/src/state.rs). This module persists a
@@ -94,30 +96,88 @@ class JobState:
 _JOB_STATE_FIELDS: frozenset[str] = frozenset(f.name for f in fields(JobState))
 
 
+def _env_nonempty(name: str) -> str | None:
+    """Return env var value if set and non-empty; empty string counts as unset.
+
+    Mirrors Rust ``paths.rs`` (filter empty XDG/LOCALAPPDATA so we never
+    resolve a CWD-relative data root).
+    """
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    return value
+
+
 def _platform_data_dir() -> Path:
     """Return a platform-aware user data directory for worktrees-hives."""
     if sys.platform == "win32":
-        base = os.environ.get("LOCALAPPDATA")
+        base = _env_nonempty("LOCALAPPDATA")
         if base:
             return Path(base) / "worktrees-hives"
         return Path.home() / "AppData" / "Local" / "worktrees-hives"
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "worktrees-hives"
-    # Linux / other Unix: XDG
-    xdg_data = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
-    return Path(xdg_data) / "worktrees-hives"
+    # Linux / other Unix: XDG — empty XDG_DATA_HOME must not become Path('')/…
+    xdg_data = _env_nonempty("XDG_DATA_HOME")
+    if xdg_data:
+        return Path(xdg_data) / "worktrees-hives"
+    return Path.home() / ".local" / "share" / "worktrees-hives"
 
 
 def _default_state_path() -> Path:
     """Return the default Python watchlist state file path.
 
-    Honors WH_WATCHLIST_PATH only. Never falls back to WH_STATE_PATH
+    Honors WH_WATCHLIST_PATH only (non-empty). Never falls back to WH_STATE_PATH
     (Rust array-backed watched.json). Pass an explicit path or --state for tests.
     """
-    env_path = os.environ.get(WH_WATCHLIST_PATH_ENV)
+    env_path = _env_nonempty(WH_WATCHLIST_PATH_ENV)
     if env_path:
         return Path(env_path)
     return _platform_data_dir() / STATE_FILENAME
+
+
+@contextlib.contextmanager
+def _exclusive_lock(path: Path) -> Iterator[None]:
+    """Cross-process exclusive lock for watchlist read-modify-write.
+
+    Uses a sibling lock file so concurrent CLI/orchestrator processes serialize
+    mutations and do not overwrite each other's jobs via stale in-memory snapshots.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise CorruptStateError(f"Cannot create watchlist lock dir for {path}: {e}") from e
+    lock_path = path.parent / f".{path.name}.lock"
+    try:
+        with open(lock_path, "a+", encoding="utf-8") as lock_f:
+            if sys.platform == "win32":
+                import msvcrt
+
+                lock_f.seek(0)
+                if lock_f.read(1) == "":
+                    lock_f.write("0")
+                    lock_f.flush()
+                lock_f.seek(0)
+                msvcrt.locking(lock_f.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                with contextlib.suppress(OSError):
+                    if sys.platform == "win32":
+                        import msvcrt
+
+                        lock_f.seek(0)
+                        msvcrt.locking(lock_f.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+    except OSError as e:
+        raise CorruptStateError(f"Cannot open watchlist lock at {lock_path}: {e}") from e
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -250,6 +310,17 @@ class Watchlist:
         """Return the state file path."""
         return self._path
 
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Serialize mutations: exclusive lock + reload before the critical section.
+
+        Callers must invoke ``_save()`` inside the ``with`` block after mutating
+        in-memory state so concurrent processes cannot overwrite each other.
+        """
+        with _exclusive_lock(self._path):
+            self._load()
+            yield
+
     def _load(self) -> None:
         """Load state from disk; clamp max_fixes; filter by owner allowlist.
 
@@ -273,8 +344,15 @@ class Watchlist:
             )
         # Preserve unknown top-level keys for additive v1 round-trip.
         self._top_extras = {k: v for k, v in data.items() if k not in {"schema_version", "jobs"}}
+        if "jobs" in data and not isinstance(data["jobs"], dict):
+            # e.g. "jobs": [] from a bad recovery — do not normalize to {} and wipe on save.
+            raise CorruptStateError(
+                f"Malformed jobs block in {self._path}: expected JSON object, "
+                f"got {type(data['jobs']).__name__}"
+            )
         jobs_data = data.get("jobs", {})
         if not isinstance(jobs_data, dict):
+            # Defensive: absent key defaults above; any other type already rejected.
             jobs_data = {}
         self._jobs = {}
         self._job_extras = {}
@@ -282,6 +360,8 @@ class Watchlist:
         for job_id, job_dict in jobs_data.items():
             jid = str(job_id)
             if not isinstance(job_dict, dict):
+                # Preserve non-object entries under a wrapper so they are not dropped.
+                self._deferred_raw[jid] = {"_invalid_job_entry": job_dict}
                 continue
             raw = dict(job_dict)
             try:
@@ -364,33 +444,35 @@ class Watchlist:
                 "OWNER_NOT_ALLOWED",
                 f"Owner {owner!r} not in allowlist ({hint})",
             )
-        if job_id in self._jobs:
-            raise ValueError(f"Job {job_id!r} already exists in watchlist")
-        # Promoting a previously deferred id into active set.
-        self._deferred_raw.pop(job_id, None)
-        job = JobState(
-            job_id=job_id,
-            owner=owner,
-            repo=repo,
-            branch=branch,
-            stack_id=stack_id,
-            max_fixes=max_fixes,
-        )
-        self._jobs[job_id] = job
-        self._save()
-        return job
+        with self._locked():
+            if job_id in self._jobs:
+                raise ValueError(f"Job {job_id!r} already exists in watchlist")
+            # Promoting a previously deferred id into active set.
+            self._deferred_raw.pop(job_id, None)
+            job = JobState(
+                job_id=job_id,
+                owner=owner,
+                repo=repo,
+                branch=branch,
+                stack_id=stack_id,
+                max_fixes=max_fixes,
+            )
+            self._jobs[job_id] = job
+            self._save()
+            return job
 
     def remove(self, job_id: str) -> None:
         """Remove a job from the watchlist.
 
         Raises KeyError if job_id not found.
         """
-        if job_id not in self._jobs and job_id not in self._deferred_raw:
-            raise KeyError(f"Job {job_id!r} not found in watchlist")
-        self._jobs.pop(job_id, None)
-        self._job_extras.pop(job_id, None)
-        self._deferred_raw.pop(job_id, None)
-        self._save()
+        with self._locked():
+            if job_id not in self._jobs and job_id not in self._deferred_raw:
+                raise KeyError(f"Job {job_id!r} not found in watchlist")
+            self._jobs.pop(job_id, None)
+            self._job_extras.pop(job_id, None)
+            self._deferred_raw.pop(job_id, None)
+            self._save()
 
     def get(self, job_id: str) -> JobState | None:
         """Get a job by ID, or None if not found."""
@@ -417,12 +499,13 @@ class Watchlist:
 
         Raises KeyError if job_id not found.
         """
-        job = self._jobs.get(job_id)
-        if job is None:
-            raise KeyError(f"Job {job_id!r} not found in watchlist")
-        job.status = status
-        self._save()
-        return job
+        with self._locked():
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id!r} not found in watchlist")
+            job.status = status
+            self._save()
+            return job
 
     def begin_babysit_cycle(self, cycle_id: str, job_id: str | None = None) -> None:
         """Start a babysit cycle, resetting fix_count for the cycle budget.
@@ -433,17 +516,18 @@ class Watchlist:
         """
         if not cycle_id:
             raise ValueError("cycle_id must be non-empty")
-        targets = [job_id] if job_id is not None else list(self._jobs)
-        for jid in targets:
-            job = self._jobs.get(jid)
-            if job is None:
-                if job_id is not None:
-                    raise KeyError(f"Job {job_id!r} not found in watchlist")
-                continue
-            if job.babysit_cycle != cycle_id:
-                job.babysit_cycle = cycle_id
-                job.fix_count = 0
-        self._save()
+        with self._locked():
+            targets = [job_id] if job_id is not None else list(self._jobs)
+            for jid in targets:
+                job = self._jobs.get(jid)
+                if job is None:
+                    if job_id is not None:
+                        raise KeyError(f"Job {job_id!r} not found in watchlist")
+                    continue
+                if job.babysit_cycle != cycle_id:
+                    job.babysit_cycle = cycle_id
+                    job.fix_count = 0
+            self._save()
 
     def increment_fix_count(self, job_id: str, cycle_id: str | None = None) -> JobState:
         """Increment the fix count for a job in the current babysit cycle.
@@ -457,60 +541,64 @@ class Watchlist:
         Raises KeyError if job_id not found.
         Raises PolicyError if fix budget or safety ceiling is exhausted.
         """
-        job = self._jobs.get(job_id)
-        if job is None:
-            raise KeyError(f"Job {job_id!r} not found in watchlist")
-        if cycle_id is not None and job.babysit_cycle != cycle_id:
-            job.babysit_cycle = cycle_id
-            job.fix_count = 0
-        effective_max = min(job.max_fixes, MAX_FIXES_CEILING)
-        if job.fix_count >= effective_max:
-            raise PolicyError(
-                "FIX_BUDGET_EXHAUSTED",
-                f"Job {job_id!r} has exhausted its fix budget "
-                f"({effective_max}; ceiling {MAX_FIXES_CEILING})",
-            )
-        job.fix_count += 1
-        self._save()
-        return job
+        with self._locked():
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id!r} not found in watchlist")
+            if cycle_id is not None and job.babysit_cycle != cycle_id:
+                job.babysit_cycle = cycle_id
+                job.fix_count = 0
+            effective_max = min(job.max_fixes, MAX_FIXES_CEILING)
+            if job.fix_count >= effective_max:
+                raise PolicyError(
+                    "FIX_BUDGET_EXHAUSTED",
+                    f"Job {job_id!r} has exhausted its fix budget "
+                    f"({effective_max}; ceiling {MAX_FIXES_CEILING})",
+                )
+            job.fix_count += 1
+            self._save()
+            return job
 
     def set_blockers(self, job_id: str, blockers: list[str]) -> JobState:
         """Set residual blockers for a job.
 
         Raises KeyError if job_id not found.
         """
-        job = self._jobs.get(job_id)
-        if job is None:
-            raise KeyError(f"Job {job_id!r} not found in watchlist")
-        job.residual_blockers = list(blockers)
-        self._save()
-        return job
+        with self._locked():
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id!r} not found in watchlist")
+            job.residual_blockers = list(blockers)
+            self._save()
+            return job
 
     def set_pr(self, job_id: str, pr_number: int, pr_url: str) -> JobState:
         """Set PR info for a job.
 
         Raises KeyError if job_id not found.
         """
-        job = self._jobs.get(job_id)
-        if job is None:
-            raise KeyError(f"Job {job_id!r} not found in watchlist")
-        job.pr_number = pr_number
-        job.pr_url = pr_url
-        self._save()
-        return job
+        with self._locked():
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id!r} not found in watchlist")
+            job.pr_number = pr_number
+            job.pr_url = pr_url
+            self._save()
+            return job
 
     def record_check(self, job_id: str, error: str | None = None) -> JobState:
         """Record a check timestamp (and optional error) for a job and persist.
 
         Raises KeyError if job_id not found.
         """
-        job = self._jobs.get(job_id)
-        if job is None:
-            raise KeyError(f"Job {job_id!r} not found in watchlist")
-        job.last_check = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        job.error = error
-        self._save()
-        return job
+        with self._locked():
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id!r} not found in watchlist")
+            job.last_check = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            job.error = error
+            self._save()
+            return job
 
     def check(
         self,
@@ -536,6 +624,19 @@ class Watchlist:
         Note: a green PR with remaining budget is **ready**, not needs_fix.
         Exhausted budget with blockers is **blocked**, not ready.
         """
+        if record:
+            with self._locked():
+                return self._check_unlocked(owner=owner, repo=repo, record=True)
+        return self._check_unlocked(owner=owner, repo=repo, record=False)
+
+    def _check_unlocked(
+        self,
+        owner: str | None = None,
+        repo: str | None = None,
+        *,
+        record: bool = True,
+    ) -> dict[str, list[JobState]]:
+        """Categorize jobs; when ``record`` is True, stamp and save (caller holds lock)."""
         result: dict[str, list[JobState]] = {
             "needs_pr": [],
             "needs_fix": [],
