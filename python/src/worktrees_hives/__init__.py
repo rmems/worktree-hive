@@ -50,7 +50,7 @@ __all__ = [
     "WorkerResult",
     "WorkerSpec",
     "WorkerStatus",
+    "__version__",
     "format_attribution",
     "format_reply",
-    "__version__",
 ]

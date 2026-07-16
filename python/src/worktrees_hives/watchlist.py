@@ -13,9 +13,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-# Documented state filename (AGENTS.md / Rust contract). Override with WH_STATE_PATH.
-STATE_FILENAME = "watched.json"
+# Python orchestrator watchlist store (separate from Rust `watched.json`).
+# Rust `wh status`/`wh jobs` expect a JSON *array* of JobStatus at WH_STATE_PATH/
+# watched.json (see crates/wh-core/src/state.rs). This module persists a
+# Python-side map envelope; do not share the same file until schemas unify.
+# Override path with WH_WATCHLIST_PATH (preferred) or WH_STATE_PATH for tests.
+STATE_FILENAME = "watchlist.json"
 WH_STATE_PATH_ENV = "WH_STATE_PATH"
+WH_WATCHLIST_PATH_ENV = "WH_WATCHLIST_PATH"
 WH_ALLOWED_OWNERS_ENV = "WH_ALLOWED_OWNERS"
 MAX_FIXES_CEILING = 3
 
@@ -60,6 +65,8 @@ class JobState:
     stack_id: str | None = None
     fix_count: int = 0
     max_fixes: int = 3
+    # Identifies the current babysit cycle for fix-budget accounting (AGENTS.md).
+    babysit_cycle: str | None = None
     residual_blockers: list[str] = field(default_factory=list)
     pr_number: int | None = None
     pr_url: str | None = None
@@ -105,25 +112,34 @@ def _platform_data_dir() -> Path:
 
 
 def _default_state_path() -> Path:
-    """Return the default state file path.
+    """Return the default Python watchlist state file path.
 
-    Honors WH_STATE_PATH when set; otherwise uses platform data dir + watched.json.
+    Honors WH_WATCHLIST_PATH, then WH_STATE_PATH (tests/legacy), else
+    platform data dir + watchlist.json (not Rust watched.json).
     """
-    env_path = os.environ.get(WH_STATE_PATH_ENV)
-    if env_path:
-        return Path(env_path)
+    for key in (WH_WATCHLIST_PATH_ENV, WH_STATE_PATH_ENV):
+        env_path = os.environ.get(key)
+        if env_path:
+            return Path(env_path)
     return _platform_data_dir() / STATE_FILENAME
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     """Write JSON atomically using temp file + rename."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp", prefix=".watched-")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp", prefix=".watched-")
+    except OSError as e:
+        raise CorruptStateError(f"Cannot create watchlist state at {path}: {e}") from e
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, sort_keys=True)
             f.write("\n")
         os.replace(tmp_path, path)
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise CorruptStateError(f"Cannot write watchlist state at {path}: {e}") from e
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
@@ -148,7 +164,7 @@ def _read_json(path: Path) -> dict[str, Any]:
     """Read JSON state file.
 
     Missing file → empty dict (first run).
-    Corrupt JSON → quarantine the file and raise CorruptStateError (never silent wipe).
+    Corrupt JSON / I/O errors → CorruptStateError (never silent wipe / traceback).
     """
     if not path.exists():
         return {}
@@ -162,8 +178,15 @@ def _read_json(path: Path) -> dict[str, Any]:
                     pos=0,
                 )
             return result
+    except OSError as e:
+        raise CorruptStateError(f"Cannot read watchlist state at {path}: {e}") from e
     except json.JSONDecodeError as e:
-        quarantine = _quarantine_corrupt(path)
+        try:
+            quarantine = _quarantine_corrupt(path)
+        except OSError as oe:
+            raise CorruptStateError(
+                f"Corrupt watchlist state at {path} (and quarantine failed: {oe}): {e}"
+            ) from e
         raise CorruptStateError(
             f"Corrupt watchlist state at {path}; quarantined to {quarantine}: {e}. "
             "Refusing to load empty state that would wipe durable data on next save."
@@ -202,7 +225,8 @@ class Watchlist:
     """Persistent watchlist for multi-job hive state.
 
     State is stored as JSON at a configurable path (default: platform data dir /
-    watched.json, or WH_STATE_PATH). Writes are atomic (temp file + rename).
+    watchlist.json, or WH_WATCHLIST_PATH / WH_STATE_PATH). Writes are atomic
+    (temp file + rename). Separate from Rust ``watched.json`` array store.
     """
 
     def __init__(
@@ -217,6 +241,7 @@ class Watchlist:
         # Raw job records not active in this process (disallowed owner / unparseable).
         # Re-written on save so a partial load never permanently drops durable entries.
         self._deferred_raw: dict[str, dict[str, Any]] = {}
+        self._top_extras: dict[str, Any] = {}
         if allowed_owners is None:
             self._allowed_owners = load_allowed_owners_from_env()
         else:
@@ -239,6 +264,18 @@ class Watchlist:
         ``_deferred_raw`` so the next save does not permanently erase them.
         """
         data = _read_json(self._path)
+        schema = data.get("schema_version", 1)
+        try:
+            schema_i = int(schema)
+        except (TypeError, ValueError) as e:
+            raise CorruptStateError(f"Invalid schema_version in {self._path}: {schema!r}") from e
+        if schema_i > 1:
+            raise CorruptStateError(
+                f"Unsupported watchlist schema_version {schema_i} in {self._path} "
+                f"(this build supports 1 only)"
+            )
+        # Preserve unknown top-level keys for additive v1 round-trip.
+        self._top_extras = {k: v for k, v in data.items() if k not in {"schema_version", "jobs"}}
         jobs_data = data.get("jobs", {})
         if not isinstance(jobs_data, dict):
             jobs_data = {}
@@ -298,6 +335,9 @@ class Watchlist:
             "schema_version": 1,
             "jobs": jobs,
         }
+        for key, value in self._top_extras.items():
+            if key not in data:
+                data[key] = value
         _atomic_write_json(self._path, data)
 
     def add(
@@ -384,11 +424,35 @@ class Watchlist:
         self._save()
         return job
 
-    def increment_fix_count(self, job_id: str) -> JobState:
-        """Increment the fix count for a job.
+    def begin_babysit_cycle(self, cycle_id: str, job_id: str | None = None) -> None:
+        """Start a babysit cycle, resetting fix_count for the cycle budget.
+
+        Per AGENTS.md the 3-fix cap is per babysit cycle. When ``cycle_id``
+        differs from the job's stored ``babysit_cycle``, ``fix_count`` resets
+        to 0. Pass ``job_id`` to scope one job; omit to apply to all active jobs.
+        """
+        if not cycle_id:
+            raise ValueError("cycle_id must be non-empty")
+        targets = [job_id] if job_id is not None else list(self._jobs)
+        for jid in targets:
+            job = self._jobs.get(jid)
+            if job is None:
+                if job_id is not None:
+                    raise KeyError(f"Job {job_id!r} not found in watchlist")
+                continue
+            if job.babysit_cycle != cycle_id:
+                job.babysit_cycle = cycle_id
+                job.fix_count = 0
+        self._save()
+
+    def increment_fix_count(self, job_id: str, cycle_id: str | None = None) -> JobState:
+        """Increment the fix count for a job in the current babysit cycle.
 
         Enforces both the per-job max_fixes budget and the global safety
         ceiling (MAX_FIXES_CEILING) so a misconfigured max cannot exceed policy.
+
+        If ``cycle_id`` is provided and differs from the job's cycle, the
+        budget resets (new babysit cycle) before incrementing.
 
         Raises KeyError if job_id not found.
         Raises PolicyError if fix budget or safety ceiling is exhausted.
@@ -396,6 +460,9 @@ class Watchlist:
         job = self._jobs.get(job_id)
         if job is None:
             raise KeyError(f"Job {job_id!r} not found in watchlist")
+        if cycle_id is not None and job.babysit_cycle != cycle_id:
+            job.babysit_cycle = cycle_id
+            job.fix_count = 0
         effective_max = min(job.max_fixes, MAX_FIXES_CEILING)
         if job.fix_count >= effective_max:
             raise PolicyError(
@@ -454,8 +521,9 @@ class Watchlist:
         """Check jobs and categorize by action needed.
 
         Categories:
-          - needs_pr: actionable job with no PR yet
+          - needs_pr: pending/actionable job with no PR yet (not already running)
           - needs_fix: has residual blockers and remaining fix budget
+          - in_progress: IN_PROGRESS with no PR yet (defer; do not re-queue)
           - blocked: residual blockers with exhausted budget, or explicit BLOCKED status
           - ready: has PR, no residual blockers (awaiting merge / healthy)
           - done: COMPLETED or FAILED
@@ -470,6 +538,7 @@ class Watchlist:
         result: dict[str, list[JobState]] = {
             "needs_pr": [],
             "needs_fix": [],
+            "in_progress": [],
             "blocked": [],
             "ready": [],
             "done": [],
@@ -478,8 +547,8 @@ class Watchlist:
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         for job in jobs:
             if record:
+                # Stamp check time only; do not wipe durable job.error details.
                 job.last_check = now
-                job.error = None
             if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
                 result["done"].append(job)
             elif job.residual_blockers:
@@ -490,7 +559,11 @@ class Watchlist:
             elif job.status == JobStatus.BLOCKED:
                 result["blocked"].append(job)
             elif job.pr_number is None:
-                result["needs_pr"].append(job)
+                # Active worker already claimed — do not re-queue PR creation.
+                if job.status == JobStatus.IN_PROGRESS:
+                    result["in_progress"].append(job)
+                else:
+                    result["needs_pr"].append(job)
             else:
                 # Has PR, no residual blockers — ready regardless of remaining budget
                 result["ready"].append(job)

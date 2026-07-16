@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -19,6 +19,8 @@ from worktrees_hives.watchlist import (
     load_allowed_owners_from_env,
 )
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # Explicit test allowlist (module deny-by-default when empty).
 _TEST_OWNERS = frozenset({"acme", "example-org", "other-owner"})
@@ -26,8 +28,8 @@ _TEST_OWNERS = frozenset({"acme", "example-org", "other-owner"})
 
 @pytest.fixture
 def state_path(tmp_path: Path) -> Path:
-    """Return a temporary state file path (watched.json)."""
-    return tmp_path / "watched.json"
+    """Return a temporary state file path (watchlist.json)."""
+    return tmp_path / "watchlist.json"
 
 
 @pytest.fixture
@@ -60,7 +62,7 @@ class TestAtomicWrite:
 
 class TestDefaultStatePath:
     def test_honors_wh_state_path(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        custom = tmp_path / "custom-watched.json"
+        custom = tmp_path / "custom-watchlist.json"
         monkeypatch.setenv("WH_STATE_PATH", str(custom))
         assert _default_state_path() == custom
 
@@ -70,7 +72,7 @@ class TestDefaultStatePath:
         monkeypatch.delenv("WH_STATE_PATH", raising=False)
         monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
         path = _default_state_path()
-        assert path.name == "watched.json"
+        assert path.name == "watchlist.json"
         assert "worktrees-hives" in path.parts
 
 
@@ -120,7 +122,7 @@ class TestWatchlistAdd:
             Watchlist(state_path)
         # Original moved aside; no silent empty state
         assert not state_path.exists()
-        quarantined = list(state_path.parent.glob("watched.json.corrupt.*"))
+        quarantined = list(state_path.parent.glob("watchlist.json.corrupt.*"))
         assert len(quarantined) == 1
 
 
@@ -545,7 +547,7 @@ class TestCliPolicyExit:
         code = main(
             [
                 "--state",
-                str(tmp_path / "watched.json"),
+                str(tmp_path / "watchlist.json"),
                 "watchlist",
                 "add",
                 "j1",
@@ -562,7 +564,7 @@ class TestCliPolicyExit:
         from worktrees_hives.cli import main
 
         monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme")
-        state = str(tmp_path / "watched.json")
+        state = str(tmp_path / "watchlist.json")
         assert main(["--state", state, "watchlist", "add", "j1", "acme", "repo", "br"]) == 0
         assert main(["--state", state, "watchlist", "add", "j1", "acme", "repo", "br"]) == 1
 
@@ -572,7 +574,7 @@ class TestCliPolicyExit:
         from worktrees_hives.cli import main
 
         monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme")
-        state = str(tmp_path / "watched.json")
+        state = str(tmp_path / "watchlist.json")
         assert main(["--state", state, "watchlist", "remove", "missing"]) == 1
 
     def test_list_and_check_via_main(
@@ -581,7 +583,7 @@ class TestCliPolicyExit:
         from worktrees_hives.cli import main
 
         monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme")
-        state = str(tmp_path / "watched.json")
+        state = str(tmp_path / "watchlist.json")
         assert main(["--state", state, "watchlist", "add", "j1", "acme", "repo", "br"]) == 0
         assert main(["--state", state, "watchlist", "list", "--owner", "acme"]) == 0
         out = capsys.readouterr().out
@@ -598,3 +600,47 @@ class TestCliPolicyExit:
         assert exc.value.code == 0
         out = capsys.readouterr().out
         assert "worktrees-hives" in out
+
+
+class TestCheckEdgeCases:
+    def test_in_progress_not_needs_pr(self, watchlist: Watchlist) -> None:
+        watchlist.add("j1", "acme", "r1", "br")
+        watchlist.update_status("j1", JobStatus.IN_PROGRESS)
+        result = watchlist.check(record=False)
+        assert result["needs_pr"] == []
+        assert len(result["in_progress"]) == 1
+
+    def test_check_preserves_error(self, watchlist: Watchlist) -> None:
+        watchlist.add("j1", "acme", "r1", "br")
+        watchlist.record_check("j1", error="boom")
+        result = watchlist.check(record=True)
+        job = watchlist.get("j1")
+        assert job is not None
+        assert job.error == "boom"
+        assert job.last_check is not None
+        assert any(result.values())
+
+    def test_babysit_cycle_resets_fix_count(self, watchlist: Watchlist) -> None:
+        watchlist.add("j1", "acme", "r1", "br", max_fixes=3)
+        watchlist.increment_fix_count("j1", cycle_id="c1")
+        watchlist.increment_fix_count("j1", cycle_id="c1")
+        assert watchlist.get("j1").fix_count == 2
+        watchlist.begin_babysit_cycle("c2", "j1")
+        assert watchlist.get("j1").fix_count == 0
+        assert watchlist.get("j1").babysit_cycle == "c2"
+
+    def test_schema_version_too_new_raises(self, state_path: Path) -> None:
+        state_path.write_text(
+            json.dumps({"schema_version": 99, "jobs": {}}),
+            encoding="utf-8",
+        )
+        with pytest.raises(CorruptStateError, match="Unsupported"):
+            Watchlist(state_path, allowed_owners=_TEST_OWNERS)
+
+    def test_io_error_on_directory_state(self, tmp_path: Path) -> None:
+        d = tmp_path / "not-a-file"
+        d.mkdir()
+        with pytest.raises(
+            CorruptStateError, match=r"Cannot read|Cannot write|Cannot create"
+        ):
+            Watchlist(d, allowed_owners=_TEST_OWNERS)

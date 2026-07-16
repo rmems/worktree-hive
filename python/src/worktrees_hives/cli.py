@@ -6,6 +6,7 @@ Does NOT register as `wh` — that name is reserved for the Rust binary.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -73,15 +74,64 @@ def cmd_remove(args: argparse.Namespace) -> int:
         return 1
 
 
+def _v1_envelope(
+    command: str,
+    data: dict[str, object],
+    *,
+    ok: bool = True,
+    error: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """Build a v1 CLI JSON envelope (schema_version=1)."""
+    return {
+        "ok": ok,
+        "schema_version": 1,
+        "command": command,
+        "data": data,
+        "error": error,
+    }
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     """Handle watchlist list command."""
     try:
         w = _watchlist_from_args(args)
     except CorruptStateError as e:
         print(f"Error: {e}", file=sys.stderr)
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    _v1_envelope(
+                        "watchlist.list",
+                        {"jobs": []},
+                        ok=False,
+                        error={"code": "CORRUPT_STATE", "message": str(e)},
+                    )
+                )
+            )
         return 1
     status_filter = JobStatus(args.status) if args.status else None
     jobs = w.list_jobs(owner=args.owner, repo=args.repo, status=status_filter)
+    if getattr(args, "json", False):
+        payload = [
+            {
+                "job_id": j.job_id,
+                "owner": j.owner,
+                "repo": j.repo,
+                "branch": j.branch,
+                "status": j.status.value,
+                "pr_number": j.pr_number,
+                "pr_url": j.pr_url,
+                "fix_count": j.fix_count,
+                "max_fixes": j.max_fixes,
+                "babysit_cycle": j.babysit_cycle,
+                "residual_blockers": list(j.residual_blockers),
+                "last_check": j.last_check,
+                "error": j.error,
+            }
+            for j in jobs
+        ]
+        print(json.dumps(_v1_envelope("watchlist.list", {"jobs": payload})))
+        return 0
     if not jobs:
         print("No jobs in watchlist")
         return 0
@@ -96,8 +146,38 @@ def cmd_check(args: argparse.Namespace) -> int:
         w = _watchlist_from_args(args)
     except CorruptStateError as e:
         print(f"Error: {e}", file=sys.stderr)
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    _v1_envelope(
+                        "watchlist.check",
+                        {"categories": {}},
+                        ok=False,
+                        error={"code": "CORRUPT_STATE", "message": str(e)},
+                    )
+                )
+            )
         return 1
     categories = w.check(owner=args.owner, repo=args.repo)
+    if getattr(args, "json", False):
+        data = {
+            cat: [
+                {
+                    "job_id": j.job_id,
+                    "owner": j.owner,
+                    "repo": j.repo,
+                    "branch": j.branch,
+                    "status": j.status.value,
+                    "pr_number": j.pr_number,
+                    "error": j.error,
+                    "last_check": j.last_check,
+                }
+                for j in jobs
+            ]
+            for cat, jobs in categories.items()
+        }
+        print(json.dumps(_v1_envelope("watchlist.check", {"categories": data})))
+        return 0
     has_work = False
     for category, jobs in categories.items():
         if jobs:
@@ -119,8 +199,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--state",
         help=(
-            "Path to watched state file (default: WH_STATE_PATH or platform data dir/watched.json)"
+            "Path to watchlist state file "
+            "(default: WH_WATCHLIST_PATH / WH_STATE_PATH / platform data dir/watchlist.json)"
         ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a v1 JSON envelope on stdout (diagnostics on stderr)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
