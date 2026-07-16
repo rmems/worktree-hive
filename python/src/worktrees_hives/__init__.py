@@ -29,6 +29,8 @@ from worktrees_hives.orchestrator import (
 
 __version__ = "0.1.0"
 
+__version__ = "0.1.0"
+
 __all__ = [
     "AttributionConfig",
     "AttributionPlacement",
@@ -48,7 +50,7 @@ __all__ = [
     "WorkerResult",
     "WorkerSpec",
     "WorkerStatus",
+    "__version__",
     "format_attribution",
     "format_reply",
-    "__version__",
 ]

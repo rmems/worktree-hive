@@ -44,6 +44,10 @@ Homepage = "https://github.com/rmems/worktrees-hives"
 Repository = "https://github.com/rmems/worktrees-hives"
 Issues = "https://github.com/rmems/worktrees-hives/issues"
 
+[project.scripts]
+worktrees-hives = "worktrees_hives.cli:main"
+wh-orch = "worktrees_hives.cli:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/worktrees_hives"]
 

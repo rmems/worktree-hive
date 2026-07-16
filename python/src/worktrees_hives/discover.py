@@ -86,7 +86,7 @@ def _run_gh(args: list[str]) -> tuple[str, str, int]:
     """Run a gh CLI command and return stdout, stderr, returncode."""
     try:
         result = subprocess.run(
-            ["gh"] + args,
+            ["gh", *args],
             capture_output=True,
             text=True,
             timeout=60,

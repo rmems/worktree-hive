@@ -196,7 +196,7 @@ class TestDiscoverIssuesForRepo:
         """Test handling of JSON parse errors."""
         mock_run_gh.return_value = ("invalid json", "", 0)
 
-        issues, error, truncated = discover_issues_for_repo("acme", "test-repo")
+        issues, error, _truncated = discover_issues_for_repo("acme", "test-repo")
 
         assert issues == []
         assert error is not None
@@ -209,7 +209,9 @@ class TestDiscoverIssuesForRepo:
         """Test issue discovery with state filter."""
         mock_run_gh.return_value = (json.dumps([sample_issue_data]), "", 0)
 
-        issues, error, truncated = discover_issues_for_repo("acme", "test-repo", IssueState.CLOSED)
+        _issues, error, _truncated = discover_issues_for_repo(
+            "acme", "test-repo", IssueState.CLOSED
+        )
 
         assert error is None
         mock_run_gh.assert_called_once_with(
