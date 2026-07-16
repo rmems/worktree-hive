@@ -17,6 +17,7 @@ This file defines how coding agents contribute to `worktrees-hives` and how the 
 - **Limit code-fix commits** to three per PR per babysit cycle. Replies are unlimited.
 - **Process stacked PRs** from the bottom of the stack upward.
 - **Post review replies** only after pushing, and include the pushed SHA plus agent attribution.
+- **GitHub MCP first (non-negotiable for agents):** For PR status, CI check runs, review threads, issue reads, and PR comments on `rmems/*` / `Limen-Neural/*`, use the **GitHub MCP** (`github__pull_request_read`, list/comment tools, etc.). Do **not** default to shell `gh` for reads. Shell `gh` is allowed only when MCP is unavailable (e.g. 503) or for operations MCP cannot perform. Local `git` remains for branch/rebase/push.
 
 ### Deny-list (never execute)
 
