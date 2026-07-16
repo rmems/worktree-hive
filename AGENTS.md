@@ -13,7 +13,7 @@ This file defines how coding agents contribute to `worktrees-hives` and how the 
 - **Never merge** a pull request or invoke a merge API. A human must merge.
 - **Never use bare `git push --force`** or `git push -f`. Only `--force-with-lease` is permitted, and only for rebasing your own branch.
 - **Never edit outside** a job's assigned worktree or branch.
-- **Repository scope** is a **configured owner allowlist** (`WH_ALLOWED_OWNERS` and/or explicit API args). There is no built-in default org.
+- **Repository scope** is a **configured owner allowlist** (env `WH_ALLOWED_OWNERS` and/or explicit API args). There is no built-in default org; operators supply the owners they manage. Empty allowlist means deny-by-default for multi-owner discovery/scheduling unless a module documents otherwise (e.g. single-PR babysit with an explicit owner).
 - **Limit code-fix commits** to three per PR per babysit cycle. Replies are unlimited.
 - **Process stacked PRs** from the bottom of the stack upward.
 - **Post review replies** only after pushing, and include the pushed SHA plus agent attribution.

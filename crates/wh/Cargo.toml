@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 clap.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 wh-core = { path = "../wh-core" }
 
 [lints]

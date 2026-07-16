@@ -90,10 +90,10 @@ cargo test --workspace
 
 ## Python package
 
-The Python bridge is planned in [GitHub #30](https://github.com/rmems/worktrees-hives/issues/30). Once that package lands under `python/`, install it in editable mode with:
+The Python bridge is planned in [GitHub #30](https://github.com/rmems/worktrees-hives/issues/30). Once that package lands under `python/`, install it in editable mode with the `test` extra so the `pytest` gate can run:
 
 ```bash
-python -m pip install -e ./python
+python -m pip install -e './python[test]'
 ```
 
 Python will invoke `wh` from `WH_BIN` or `PATH` and consume the versioned JSON contract. It will not duplicate Rust-owned state or mutation logic.
