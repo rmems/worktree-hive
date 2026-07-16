@@ -78,8 +78,11 @@ const ALLOWED_GH_SUBCOMMANDS: &[&str] = &[
     "variable", "workflow",
 ];
 
-/// `gh pr` sub-subcommands that are blocked (merge is disallowed).
-const BLOCKED_GH_PR_SUBSUBCOMMANDS: &[&str] = &["merge", "ready"];
+/// `gh pr` sub-subcommands that are blocked (merge / merge-like updates).
+///
+/// `update-branch` defaults to a merge commit unless `--rebase` is passed; hive policy
+/// rejects merge-style updates entirely (and `--rebase` is already a blocked flag).
+const BLOCKED_GH_PR_SUBSUBCOMMANDS: &[&str] = &["merge", "ready", "update-branch"];
 
 /// `gh pr` flags that are blocked (direct merge-related flags).
 const BLOCKED_GH_FLAGS: &[&str] = &["--merge", "--squash", "--rebase", "--auto", "--admin"];
@@ -130,7 +133,8 @@ impl SafeGitCommand {
         }
 
         // Reject ANY bare --force / -f always; only --force-with-lease is allowed.
-        // Even when both appear together, bare force is still rejected.
+        // Exact `-f` / `--force` apply to all subcommands; combined short clusters
+        // like `-fu` are only meaningful (and checked) for `push`.
         if args.iter().any(|a| is_bare_force_flag(a)) {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::BareForcePush,
@@ -138,21 +142,30 @@ impl SafeGitCommand {
             });
         }
 
-        // Git push also accepts force via `+<src>:<dst>` refspecs. Treat those as
-        // bare force pushes so supervised jobs cannot rewrite refs without an explicit
-        // lease-protected flag.
-        if subcommand == "push" && args.iter().skip(1).any(|a| is_force_refspec(a)) {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::BareForcePush,
-                message: "force-push refspecs prefixed with `+` are not allowed; use --force-with-lease only".to_owned(),
-            });
-        }
-
-        if subcommand == "push" && args.iter().any(|a| a == "--mirror") {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::BareForcePush,
-                message: "git push --mirror is not allowed; use --force-with-lease only".to_owned(),
-            });
+        if subcommand == "push" {
+            // Combined short options: `git push -fu origin main`
+            if args.iter().any(|a| is_combined_short_force_cluster(a)) {
+                return Err(Error::PolicyViolation {
+                    code: PolicyCode::BareForcePush,
+                    message: "bare --force/-f is not allowed; use --force-with-lease only"
+                        .to_owned(),
+                });
+            }
+            // Force via `+<src>:<dst>` refspecs.
+            if args.iter().skip(1).any(|a| is_force_refspec(a)) {
+                return Err(Error::PolicyViolation {
+                    code: PolicyCode::BareForcePush,
+                    message: "force-push refspecs prefixed with `+` are not allowed; use --force-with-lease only".to_owned(),
+                });
+            }
+            // `--mirror` force-updates and deletes remote refs without a lease.
+            if args.iter().any(|a| a == "--mirror") {
+                return Err(Error::PolicyViolation {
+                    code: PolicyCode::BareForcePush,
+                    message: "git push --mirror is not allowed; use --force-with-lease only"
+                        .to_owned(),
+                });
+            }
         }
 
         if subcommand == "pull" {
@@ -279,8 +292,8 @@ impl SafeGhCommand {
             });
         }
 
-        // Block `gh pr merge` / `gh pr ready` even when inherited flags precede the
-        // subcommand, e.g. `gh pr -R owner/repo merge 1`.
+        // Block `gh pr merge` / `ready` / `update-branch` even when inherited flags
+        // precede the subcommand, e.g. `gh pr -R owner/repo merge 1`.
         if subcommand == "pr" {
             if let Some(pr_sub) = first_positional_after(&args[1..]) {
                 let blocked: HashSet<&str> = BLOCKED_GH_PR_SUBSUBCOMMANDS.iter().copied().collect();
@@ -289,6 +302,18 @@ impl SafeGhCommand {
                         code: PolicyCode::MergeBlocked,
                         message: format!("`gh pr {pr_sub}` is not allowed"),
                     });
+                }
+            }
+        }
+
+        // `gh repo clone <repo> [<dir>]` can write outside the worktree.
+        if subcommand == "repo" {
+            if let Some(repo_sub) = first_positional_after(&args[1..]) {
+                if repo_sub == "clone" {
+                    // Find destination after `clone` token (skip option values).
+                    if let Some(dest) = gh_repo_clone_destination(&args[1..]) {
+                        reject_external_path(Some(dest), "gh repo clone destination")?;
+                    }
                 }
             }
         }
@@ -411,23 +436,22 @@ pub fn gh_requires_branch_check(args: &[String]) -> bool {
 fn reject_external_write_targets(subcommand: &str, args: &[String]) -> Result<()> {
     match subcommand {
         "clone" => {
-            let positionals: Vec<&str> = args
-                .iter()
-                .map(String::as_str)
-                .filter(|a| !a.starts_with('-') && *a != "--")
-                .collect();
-            if positionals.len() >= 2 {
-                let dest = positionals[1];
-                let abs = dest.starts_with('/')
-                    || (dest.len() > 2 && dest.as_bytes().get(1) == Some(&b':'));
-                if abs || dest.contains("..") {
-                    return Err(Error::PolicyViolation {
-                        code: PolicyCode::PathNotAllowed,
-                        message: format!(
-                            "git clone destination `{dest}` must be a relative path under the worktree"
-                        ),
-                    });
+            reject_external_path(clone_destination(args), "git clone destination")?;
+            // Also reject absolute --separate-git-dir paths.
+            let mut i = 0;
+            while i < args.len() {
+                let a = args[i].as_str();
+                if a == "--separate-git-dir" {
+                    if let Some(path) = args.get(i + 1) {
+                        reject_external_path(Some(path.as_str()), "git clone --separate-git-dir")?;
+                    }
+                    i += 2;
+                    continue;
                 }
+                if let Some(path) = a.strip_prefix("--separate-git-dir=") {
+                    reject_external_path(Some(path), "git clone --separate-git-dir")?;
+                }
+                i += 1;
             }
         }
         "config" => {
@@ -443,32 +467,156 @@ fn reject_external_write_targets(subcommand: &str, args: &[String]) -> Result<()
                 let a = args[i].as_str();
                 if a == "-f" || a == "--file" {
                     if let Some(path) = args.get(i + 1) {
-                        let abs = path.starts_with('/')
-                            || (path.len() > 2 && path.as_bytes().get(1) == Some(&b':'));
-                        if abs || path.contains("..") {
-                            return Err(Error::PolicyViolation {
-                                code: PolicyCode::PathNotAllowed,
-                                message: format!(
-                                    "git config file `{path}` must stay under the worktree"
-                                ),
-                            });
-                        }
+                        reject_external_path(Some(path.as_str()), "git config file")?;
+                    }
+                    i += 2;
+                    continue;
+                }
+                // Attached short form: `-f/tmp/cfg` or `-f./rel`.
+                if let Some(path) = a.strip_prefix("-f") {
+                    if !path.is_empty() && !path.starts_with('-') {
+                        reject_external_path(Some(path), "git config file")?;
                     }
                 }
                 if let Some(path) = a.strip_prefix("--file=") {
-                    if path.starts_with('/') || path.contains("..") {
-                        return Err(Error::PolicyViolation {
-                            code: PolicyCode::PathNotAllowed,
-                            message: format!(
-                                "git config file `{path}` must stay under the worktree"
-                            ),
-                        });
-                    }
+                    reject_external_path(Some(path), "git config file")?;
                 }
                 i += 1;
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// `git clone` options that consume a following value (must not be treated as positionals).
+const CLONE_VALUE_OPTS: &[&str] = &[
+    "-b",
+    "--branch",
+    "-c",
+    "--config",
+    "-o",
+    "--origin",
+    "-u",
+    "--upload-pack",
+    "--reference",
+    "--reference-if-able",
+    "--separate-git-dir",
+    "--depth",
+    "--shallow-since",
+    "--shallow-exclude",
+    "--jobs",
+    "-j",
+    "--filter",
+    "--recurse-submodules",
+];
+
+/// Destination directory of `git clone` after skipping option values, if present.
+fn clone_destination(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    let mut positionals: Vec<&str> = Vec::new();
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            positionals.extend(args[i + 1..].iter().map(String::as_str));
+            break;
+        }
+        if a.starts_with('-') {
+            if a.starts_with("--") && a.contains('=') {
+                i += 1;
+                continue;
+            }
+            // Attached short form like `-bmain` is uncommon for clone; skip whole token.
+            if CLONE_VALUE_OPTS.contains(&a) {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        positionals.push(a);
+        i += 1;
+    }
+    // positionals: <repo> [<dir>]
+    if positionals.len() >= 2 {
+        Some(positionals[1])
+    } else {
+        None
+    }
+}
+
+/// Destination directory of `gh repo clone <repository> [<directory>]`, if present.
+fn gh_repo_clone_destination(args: &[String]) -> Option<&str> {
+    // args begin after top-level `repo` (caller passes &args[1..]).
+    let mut i = 0;
+    // Find `clone` token (may be preceded by global flags already stripped).
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "clone" {
+            i += 1;
+            break;
+        }
+        if a.starts_with('-') {
+            if a == "-R" || a == "--repo" {
+                i += 2;
+                continue;
+            }
+            if a.starts_with("--repo=") || a == "--help" || a == "-h" {
+                i += 1;
+                continue;
+            }
+            // Unknown flag before clone: stop (fail closed for dest detection).
+            return None;
+        }
+        // Unexpected positional before clone.
+        return None;
+    }
+    let mut positionals: Vec<&str> = Vec::new();
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            positionals.extend(args[i + 1..].iter().map(String::as_str));
+            break;
+        }
+        if a.starts_with('-') {
+            // Skip known value-taking options for gh repo clone.
+            if matches!(a, "-u" | "--upstream-remote-name" | "--") {
+                i += 2;
+                continue;
+            }
+            if a.starts_with("--") && a.contains('=') {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        positionals.push(a);
+        i += 1;
+    }
+    // positionals: <repository> [<directory>]
+    if positionals.len() >= 2 {
+        Some(positionals[1])
+    } else {
+        None
+    }
+}
+
+fn path_is_external(path: &str) -> bool {
+    path.starts_with('/')
+        || path.contains("..")
+        || (path.len() > 2 && path.as_bytes().get(1) == Some(&b':'))
+}
+
+fn reject_external_path(path: Option<&str>, label: &str) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if path_is_external(path) {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::PathNotAllowed,
+            message: format!("`{label}` `{path}` must be a relative path under the worktree"),
+        });
     }
     Ok(())
 }
@@ -490,7 +638,27 @@ pub fn checkout_or_switch_target(args: &[String]) -> Option<&str> {
             return args.get(i + 1).map(String::as_str);
         }
         if a.starts_with('-') {
-            if matches!(a, "-b" | "-B" | "-c" | "-C" | "--orphan" | "--track" | "-t") {
+            // Equals form: --create=main, --force-create=main, -c=main (rare)
+            if let Some(v) = a.strip_prefix("--create=") {
+                return Some(v);
+            }
+            if let Some(v) = a.strip_prefix("--force-create=") {
+                return Some(v);
+            }
+            if let Some(v) = a.strip_prefix("--orphan=") {
+                return Some(v);
+            }
+            if matches!(
+                a,
+                "-b" | "-B"
+                    | "-c"
+                    | "-C"
+                    | "--create"
+                    | "--force-create"
+                    | "--orphan"
+                    | "--track"
+                    | "-t"
+            ) {
                 return args.get(i + 1).map(String::as_str);
             }
             if a.starts_with("--") && a.contains('=') {
@@ -512,12 +680,23 @@ fn is_merge_subcommand(subcommand: &str) -> bool {
 /// True for bare force flags that are never allowed.
 ///
 /// `--force-with-lease` and `--force-with-lease=<ref>` are allowed and must not match.
+/// Combined short clusters (`-fu`) are handled separately for `push` only so that
+/// `git clean -fd` / `git rm -f` are not false-positives.
 fn is_bare_force_flag(arg: &str) -> bool {
     if arg == "-f" || arg == "--force" {
         return true;
     }
     // Reject `--force=...` but not `--force-with-lease` / `--force-with-lease=...`.
     arg.starts_with("--force=")
+}
+
+/// Combined short options containing `f` (e.g. `-fu`, `-uf`) used with `git push`.
+fn is_combined_short_force_cluster(arg: &str) -> bool {
+    arg.starts_with('-')
+        && !arg.starts_with("--")
+        && arg.len() > 2
+        && arg.chars().skip(1).all(|c| c.is_ascii_alphanumeric())
+        && arg.chars().skip(1).any(|c| c == 'f')
 }
 
 fn is_force_refspec(arg: &str) -> bool {
@@ -746,6 +925,99 @@ mod tests {
             "--global".to_owned(),
             "user.name".to_owned(),
             "x".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn push_combined_short_force_rejected() {
+        let err = SafeGitCommand::new(&[
+            "push".to_owned(),
+            "-fu".to_owned(),
+            "origin".to_owned(),
+            "main".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::BareForcePush,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn clone_with_branch_opt_still_rejects_abs_dest() {
+        let err = SafeGitCommand::new(&[
+            "clone".to_owned(),
+            "-b".to_owned(),
+            "main".to_owned(),
+            "https://example.com/r.git".to_owned(),
+            "/tmp/outside".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn config_attached_short_file_rejected() {
+        let err = SafeGitCommand::new(&[
+            "config".to_owned(),
+            "-f/tmp/outside".to_owned(),
+            "user.name".to_owned(),
+            "x".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn switch_create_equals_form_target() {
+        let args = vec!["switch".to_owned(), "--create=main2".to_owned()];
+        assert_eq!(checkout_or_switch_target(&args), Some("main2"));
+    }
+
+    #[test]
+    fn gh_pr_update_branch_rejected() {
+        let err =
+            SafeGhCommand::new(&["pr".to_owned(), "update-branch".to_owned(), "1".to_owned()])
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::MergeBlocked,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gh_repo_clone_abs_dest_rejected() {
+        let err = SafeGhCommand::new(&[
+            "repo".to_owned(),
+            "clone".to_owned(),
+            "cli/cli".to_owned(),
+            "/tmp/outside".to_owned(),
         ])
         .unwrap_err();
         assert!(matches!(
