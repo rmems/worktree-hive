@@ -285,3 +285,6 @@ secrets.json
 
 # Local/personal skill drafts (not product source)
 SKILL-grok-linear.md
+
+# OpenCode agent skills / local tooling (not product)
+.opencode/

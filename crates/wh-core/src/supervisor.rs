@@ -683,7 +683,7 @@ fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {
         });
     }
 
-    let canon = raw.canonicalize().map_err(|e| Error::Io {
+    let canon = crate::paths::canonicalize_for_tools(raw).map_err(|e| Error::Io {
         context: "canonicalize supervised --repo",
         source: e,
     })?;
@@ -725,7 +725,7 @@ fn supervised_worktree_base() -> PathBuf {
 
 fn normalize_existing_or_future_dir(path: &std::path::Path) -> Result<PathBuf> {
     if path.exists() {
-        return path.canonicalize().map_err(|e| Error::Io {
+        return crate::paths::canonicalize_for_tools(path).map_err(|e| Error::Io {
             context: "canonicalize worktree base",
             source: e,
         });

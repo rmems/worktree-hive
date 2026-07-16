@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "schema_version": 1,
+  "command": "worktree.create",
+  "data": {
+    "path": "/home/user/.local/share/worktrees-hives/worktrees/acme/example-repo/wh-123",
+    "branch": "feature/fix",
+    "repo_root": "/path/to/repo"
+  },
+  "error": null
+}

@@ -1,0 +1,24 @@
+{
+  "ok": true,
+  "schema_version": 1,
+  "command": "state.show",
+  "data": {
+    "jobs": [
+      {
+        "owner": "acme",
+        "repo": "example-repo",
+        "number": 42,
+        "kind": "issue",
+        "branch": "issue-42-fix",
+        "worktree_path": "/home/user/.local/share/worktrees-hives/worktrees/acme/example-repo/wh-42",
+        "stack_id": "stack-1",
+        "status": "babysitting",
+        "fix_count": 1,
+        "residual_blockers": [],
+        "created_at": 1700000000,
+        "updated_at": 1700000100
+      }
+    ]
+  },
+  "error": null
+}

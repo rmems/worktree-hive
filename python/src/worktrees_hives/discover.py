@@ -1,14 +1,27 @@
-"""Discovery module for finding eligible work across allowed GitHub owners."""
+"""Discovery module for finding eligible work across allowed GitHub owners.
+
+**Layering:** GitHub reads go through ``wh gh-safe`` (Rust ``SafeGhCommand``),
+not a raw ``gh`` subprocess. Policy, parsing, and owner allowlists stay in
+Python; path/branch/merge safety and allowlisted ``gh`` invocation stay in Rust.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-import subprocess
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Literal
+
+from worktrees_hives.bridge import WhClient
+from worktrees_hives.contract import ErrorResponse, SuccessResponse
+from worktrees_hives.errors import (
+    PolicyError,
+    WhBinaryNotFoundError,
+    WhError,
+    WhProcessError,
+)
 
 # Soft per-resource fetch cap. gh list commands paginate internally up to --limit.
 # When a response hits this cap, DiscoveryResult.truncated is set True (no silent drop).
@@ -17,9 +30,22 @@ DISCOVERY_ITEM_LIMIT = 1000
 # Env var: comma-separated owner allowlist. Empty/unset = empty default (no org hardcoding).
 WH_ALLOWED_OWNERS_ENV = "WH_ALLOWED_OWNERS"
 
+# Discovery list calls can be slow against large orgs; bridge default is 30s.
+_DISCOVERY_WH_TIMEOUT = 60.0
+
 DiscoveryKind = Literal["all", "issues", "prs"]
 
 logger = logging.getLogger(__name__)
+
+# Shared client for process-local discovery (tests may monkeypatch _run_gh).
+_default_wh_client: WhClient | None = None
+
+
+def _wh_client() -> WhClient:
+    global _default_wh_client
+    if _default_wh_client is None:
+        _default_wh_client = WhClient(timeout=_DISCOVERY_WH_TIMEOUT)
+    return _default_wh_client
 
 
 class IssueState(str, Enum):
@@ -82,22 +108,42 @@ def load_allowed_owners_from_env() -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
-def _run_gh(args: list[str]) -> tuple[str, str, int]:
-    """Run a gh CLI command and return stdout, stderr, returncode."""
+def _run_gh(args: list[str], *, client: WhClient | None = None) -> tuple[str, str, int]:
+    """Run ``gh`` via ``wh gh-safe`` and return child stdout, stderr, exit code.
+
+    Never spawns ``gh`` directly — that would bypass Rust ``SafeGhCommand``
+    (merge deny-list, allowlisted subcommands, blocked flags).
+    """
+    wh = client if client is not None else _wh_client()
     try:
-        result = subprocess.run(
-            ["gh", *args],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        return result.stdout, result.stderr, result.returncode
-    except FileNotFoundError:
-        return "", "gh CLI not found", 1
-    except OSError as e:
-        return "", f"Failed to execute gh command: {e}", 1
-    except subprocess.TimeoutExpired:
-        return "", "gh command timed out", 1
+        resp = wh.gh_safe(*args)
+    except WhBinaryNotFoundError as exc:
+        return "", str(exc), 1
+    except PolicyError as exc:
+        return "", f"Policy violation [{exc.code}]: {exc.message}", 2
+    except WhProcessError as exc:
+        detail = (exc.stderr or str(exc)).strip() or "wh gh-safe failed"
+        code = exc.returncode if isinstance(exc.returncode, int) and exc.returncode > 0 else 1
+        return "", detail, code
+    except WhError as exc:
+        return "", str(exc), 1
+
+    if isinstance(resp, ErrorResponse):
+        return "", resp.error.message, 1
+    if not isinstance(resp, SuccessResponse):
+        return "", "unexpected wh response type", 1
+
+    data = resp.data
+    stdout = data.get("stdout", "")
+    stderr = data.get("stderr", "")
+    if not isinstance(stdout, str):
+        stdout = str(stdout) if stdout is not None else ""
+    if not isinstance(stderr, str):
+        stderr = str(stderr) if stderr is not None else ""
+    exit_code = data.get("exit_code", 0)
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        exit_code = 1
+    return stdout, stderr, exit_code
 
 
 def ensure_gh_auth() -> str | None:
