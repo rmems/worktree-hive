@@ -247,15 +247,17 @@ impl SafeGhCommand {
             });
         }
 
-        // Block `gh pr merge` and `gh pr ready`.
-        if subcommand == "pr" && args.len() >= 2 {
-            let pr_sub = &args[1];
-            let blocked: HashSet<&str> = BLOCKED_GH_PR_SUBSUBCOMMANDS.iter().copied().collect();
-            if blocked.contains(pr_sub.as_str()) {
-                return Err(Error::PolicyViolation {
-                    code: PolicyCode::MergeBlocked,
-                    message: format!("`gh pr {pr_sub}` is not allowed"),
-                });
+        // Block `gh pr merge` / `gh pr ready` even when inherited flags precede the
+        // subcommand, e.g. `gh pr -R owner/repo merge 1`.
+        if subcommand == "pr" {
+            if let Some(pr_sub) = first_positional_after(&args[1..]) {
+                let blocked: HashSet<&str> = BLOCKED_GH_PR_SUBSUBCOMMANDS.iter().copied().collect();
+                if blocked.contains(pr_sub) {
+                    return Err(Error::PolicyViolation {
+                        code: PolicyCode::MergeBlocked,
+                        message: format!("`gh pr {pr_sub}` is not allowed"),
+                    });
+                }
             }
         }
 
@@ -328,6 +330,61 @@ fn resolve_current_branch(repo_dir: &Path) -> Result<String> {
     }
 
     Ok(branch)
+}
+
+/// First non-flag positional argument, skipping common `gh` inherited options that take values.
+fn first_positional_after(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            return args.get(i + 1).map(String::as_str);
+        }
+        if a.starts_with('-') {
+            if a.starts_with("--") && a.contains('=') {
+                i += 1;
+                continue;
+            }
+            if matches!(
+                a,
+                "-R" | "--repo"
+                    | "-h"
+                    | "--hostname"
+                    | "-t"
+                    | "--jq"
+                    | "-q"
+                    | "--template"
+                    | "-F"
+                    | "--field"
+                    | "-f"
+                    | "--raw-field"
+                    | "-H"
+                    | "--header"
+            ) {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        return Some(a);
+    }
+    None
+}
+
+/// Whether a validated `gh` command mutates local checkout/worktree state.
+#[must_use]
+pub fn gh_requires_branch_check(args: &[String]) -> bool {
+    if args.first().map(String::as_str) != Some("pr") {
+        return false;
+    }
+    let Some(pr_sub) = first_positional_after(&args[1..]) else {
+        return false;
+    };
+    matches!(
+        pr_sub,
+        "checkout" | "create" | "close" | "reopen" | "edit" | "ready" | "merge" | "review"
+    )
 }
 
 fn is_merge_subcommand(subcommand: &str) -> bool {
@@ -556,6 +613,26 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cmd.args(), &["pr", "create", "--title", "test"]);
+    }
+
+    #[test]
+    fn gh_pr_merge_after_repo_flag_rejected() {
+        let err = SafeGhCommand::new(&[
+            "pr".to_owned(),
+            "-R".to_owned(),
+            "acme/widgets".to_owned(),
+            "merge".to_owned(),
+            "1".to_owned(),
+            "-m".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::MergeBlocked,
+                ..
+            }
+        ));
     }
 
     #[test]

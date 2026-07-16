@@ -60,13 +60,18 @@ enum SupervisorAction {
         #[arg(long, default_value = "0")]
         timeout: u64,
 
-        /// Expected git branch for mutating supervised `git` commands.
+        /// Expected branch for mutating supervised `git` / `gh pr` commands.
         #[arg(long)]
         expected_branch: Option<String>,
 
         /// Repository working tree for supervised git branch checks (default: `.`).
         #[arg(long)]
         repo: Option<PathBuf>,
+
+        /// Max concurrent supervised children **in this process** (default 1).
+        /// Does not coordinate across separate `wh` processes.
+        #[arg(long, default_value = "1")]
+        max_parallel: usize,
 
         /// Command and arguments to run.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -112,8 +117,20 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> wh_core::error::Result<ExitCo
                 timeout,
                 expected_branch,
                 repo,
+                max_parallel,
                 cmd,
-            } => run_supervisor(cli.json, timeout, expected_branch, repo, cmd, stdout).await,
+            } => {
+                run_supervisor(
+                    cli.json,
+                    timeout,
+                    expected_branch,
+                    repo,
+                    max_parallel,
+                    cmd,
+                    stdout,
+                )
+                .await
+            }
         },
         None => {
             if cli.json {
@@ -135,6 +152,7 @@ async fn run_supervisor(
     timeout_secs: u64,
     expected_branch: Option<String>,
     repo: Option<PathBuf>,
+    max_parallel: usize,
     cmd: Vec<String>,
     stdout: &mut impl Write,
 ) -> wh_core::error::Result<ExitCode> {
@@ -161,7 +179,7 @@ async fn run_supervisor(
 
     // One-shot CLI: a single awaited child cannot contend with itself.
     // Library callers may still use Supervisor::new(n) for in-process fan-out.
-    let supervisor = wh_core::supervisor::Supervisor::new(1);
+    let supervisor = wh_core::supervisor::Supervisor::new(max_parallel.max(1));
     match supervisor.run(program, &args, timeout, &options).await {
         Ok(output) => {
             write_supervisor_result(json, Ok(&output), stdout)?;
@@ -195,29 +213,9 @@ fn write_supervisor_result(
 
     let (ok, data, error) = match result {
         Ok(output) => {
+            // Always ok:true for completed runs so WhClient keeps `data` (exit_code, timed_out, …).
             let data = serde_json::to_value(output).map_err(io::Error::other)?;
-            if output.succeeded() {
-                (true, data, None)
-            } else {
-                let code = output
-                    .error_code
-                    .and_then(|c| serde_json::to_value(c).ok())
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_else(|| "SUPERVISOR_FAILED".to_owned());
-                let message = if output.stderr.is_empty() {
-                    format!(
-                        "supervised command failed (exit_code={:?})",
-                        output.exit_code
-                    )
-                } else {
-                    output.stderr.clone()
-                };
-                (
-                    false,
-                    data,
-                    Some(wh_core::contract::ErrorData { code, message }),
-                )
-            }
+            (true, data, None)
         }
         Err(wh_core::error::Error::PolicyViolation { code, message }) => (
             false,
@@ -623,6 +621,7 @@ mod tests {
                     timeout: 0,
                     expected_branch: None,
                     repo: None,
+                    max_parallel: 1,
                     cmd: {
                         #[cfg(windows)]
                         {
@@ -656,6 +655,7 @@ mod tests {
                     timeout: 0,
                     expected_branch: None,
                     repo: None,
+                    max_parallel: 1,
                     cmd: vec!["git".to_owned(), "push".to_owned(), "--force".to_owned()],
                 },
             }),
@@ -682,6 +682,7 @@ mod tests {
                     timeout: 0,
                     expected_branch: None,
                     repo: None,
+                    max_parallel: 1,
                     cmd: vec![
                         "/usr/bin/git".to_owned(),
                         "push".to_owned(),
@@ -723,6 +724,7 @@ mod tests {
                     timeout: 0,
                     expected_branch: None,
                     repo: None,
+                    max_parallel: 1,
                     cmd: {
                         #[cfg(windows)]
                         {
@@ -750,8 +752,7 @@ mod tests {
         assert_eq!(code, ExitCode::SUCCESS);
         let v: serde_json::Value =
             serde_json::from_str(str::from_utf8(&stdout).unwrap().trim()).unwrap();
-        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(false));
-        assert!(v.get("error").is_some());
+        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(true));
         let exit = v
             .get("data")
             .and_then(|d| d.get("exit_code"))
@@ -759,6 +760,12 @@ mod tests {
         assert!(
             exit.is_some_and(|c| c != 0),
             "expected nonzero exit in data, got {exit:?}"
+        );
+        assert_eq!(
+            v.get("data")
+                .and_then(|d| d.get("error_code"))
+                .and_then(|c| c.as_str()),
+            Some("NON_ZERO_EXIT")
         );
     }
 
@@ -771,6 +778,7 @@ mod tests {
                     timeout: 0,
                     expected_branch: None,
                     repo: None,
+                    max_parallel: 1,
                     cmd: vec!["gh".to_owned(), "pr".to_owned(), "merge".to_owned()],
                 },
             }),
@@ -797,6 +805,7 @@ mod tests {
                     timeout: 0,
                     expected_branch: None,
                     repo: None,
+                    max_parallel: 1,
                     cmd: {
                         #[cfg(windows)]
                         {

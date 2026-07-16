@@ -234,9 +234,9 @@ impl Supervisor {
         }
 
         // Branch check immediately before spawn, while holding the permit.
+        // Always verify via git HEAD, for both supervised git and mutating gh.
         if let Some(ref check) = prepared.branch_check {
-            let safe = SafeGitCommand::new(&prepared.args)?;
-            safe.verify_branch(&check.repo, &check.expected_branch)?;
+            verify_repo_branch(&check.repo, &check.expected_branch)?;
         }
 
         let guard = ActiveGuard::arm(self);
@@ -486,11 +486,33 @@ fn prepare_supervised_command(
         "gh" => {
             let _safe = SafeGhCommand::new(&owned_args)?;
             // Always spawn PATH `gh`, never a user-supplied path-qualified binary.
+            let (cwd, branch_check) = if crate::git_safe::gh_requires_branch_check(&owned_args) {
+                let expected =
+                    options
+                        .expected_branch
+                        .clone()
+                        .ok_or_else(|| Error::PolicyViolation {
+                            code: PolicyCode::BranchMismatch,
+                            message:
+                                "mutating gh pr commands require --expected-branch under supervisor"
+                                    .to_owned(),
+                        })?;
+                let repo = resolve_supervised_repo(options.repo.as_deref())?;
+                (
+                    Some(repo.clone()),
+                    Some(BranchCheck {
+                        expected_branch: expected,
+                        repo,
+                    }),
+                )
+            } else {
+                (None, None)
+            };
             Ok(PreparedCommand {
                 program: "gh".to_owned(),
                 args: owned_args,
-                cwd: None,
-                branch_check: None,
+                cwd,
+                branch_check,
             })
         }
         _ => Ok(PreparedCommand {
@@ -545,6 +567,11 @@ fn is_forbidden_wrapper(name: &str) -> bool {
             | "wget"
             | "http"
             | "httpie"
+            | "nodejs"
+            | "nc"
+            | "ncat"
+            | "netcat"
+            | "socat"
     )
 }
 
@@ -554,6 +581,11 @@ fn is_forbidden_wrapper(name: &str) -> bool {
 /// - Canonicalizes to an existing directory.
 /// - Requires the path to stay under `WH_WORKTREE_BASE` when set, otherwise under
 ///   the documented default `{user_data_dir}/worktrees-hives/worktrees` root.
+fn verify_repo_branch(repo: &std::path::Path, expected_branch: &str) -> Result<()> {
+    let cmd = SafeGitCommand::new(&["rev-parse".to_owned(), "HEAD".to_owned()])?;
+    cmd.verify_branch(repo, expected_branch)
+}
+
 fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {
     use std::path::{Component, Path};
 
@@ -561,10 +593,9 @@ fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {
 
     let raw = repo.unwrap_or_else(|| Path::new("."));
     if raw.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(Error::SandboxViolation {
-            base: PathBuf::from("repo"),
-            candidate: raw.to_path_buf(),
-            reason: "parent-directory components are not allowed in --repo",
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::PathNotAllowed,
+            message: "parent-directory components are not allowed in --repo".to_owned(),
         });
     }
 
@@ -573,19 +604,24 @@ fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {
         source: e,
     })?;
     if !canon.is_dir() {
-        return Err(Error::SandboxViolation {
-            base: PathBuf::from("repo"),
-            candidate: canon,
-            reason: "supervised --repo must be an existing directory",
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::PathNotAllowed,
+            message: format!(
+                "supervised --repo must be an existing directory: {}",
+                canon.display()
+            ),
         });
     }
 
     let base = normalize_existing_or_future_dir(&worktree_base)?;
     if !canon.starts_with(&base) {
-        return Err(Error::SandboxViolation {
-            base,
-            candidate: canon,
-            reason: "supervised --repo escapes the configured worktree base",
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::PathNotAllowed,
+            message: format!(
+                "supervised --repo `{}` escapes worktree base `{}`",
+                canon.display(),
+                base.display()
+            ),
         });
     }
 
@@ -682,18 +718,21 @@ async fn read_pipe<R: AsyncReadExt + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
         Some(reader) => {
             let mut buf = Vec::new();
             let mut chunk = [0u8; 8192];
+            let mut capped = false;
             loop {
-                if buf.len() >= MAX_CAPTURE_BYTES {
-                    break;
-                }
                 match reader.read(&mut chunk).await {
                     Ok(0) => break,
                     Ok(n) => {
-                        let room = MAX_CAPTURE_BYTES.saturating_sub(buf.len());
-                        buf.extend_from_slice(&chunk[..n.min(room)]);
-                        if n > room {
-                            break;
+                        if !capped {
+                            let room = MAX_CAPTURE_BYTES.saturating_sub(buf.len());
+                            if room > 0 {
+                                buf.extend_from_slice(&chunk[..n.min(room)]);
+                            }
+                            if n > room || buf.len() >= MAX_CAPTURE_BYTES {
+                                capped = true;
+                            }
                         }
+                        // When capped, keep draining so the child does not get SIGPIPE/EPIPE.
                     }
                     Err(_) => break,
                 }
@@ -914,7 +953,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(matches!(err, Error::SandboxViolation { .. }));
+        assert!(matches!(err, Error::PolicyViolation { .. }));
     }
 
     #[test]
