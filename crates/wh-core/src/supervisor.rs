@@ -559,13 +559,33 @@ fn prepare_supervised_command(
                 branch_check,
             })
         }
-        _ => Ok(PreparedCommand {
-            program: program.to_owned(),
-            args: owned_args,
-            cwd: None,
-            branch_check: None,
-        }),
+        _ => {
+            // Fail closed on path-qualified / relative scripts (./tools/run, tools/run).
+            // Basename-only PATH lookups remain for non-sensitive tooling; git/gh above are
+            // always PATH-forced. Shebang wrappers in the worktree cannot be invoked by path.
+            if program_is_path_qualified(program) {
+                return Err(Error::PolicyViolation {
+                    code: PolicyCode::SubcommandNotAllowed,
+                    message: format!(
+                        "supervised program `{program}` is path-qualified; invoke a PATH binary by basename only (git, gh, …)"
+                    ),
+                });
+            }
+            Ok(PreparedCommand {
+                program: program.to_owned(),
+                args: owned_args,
+                cwd: None,
+                branch_check: None,
+            })
+        }
     }
+}
+
+fn program_is_path_qualified(program: &str) -> bool {
+    program.contains('/')
+        || program.contains('\\')
+        || program.starts_with('.')
+        || (program.len() > 2 && program.as_bytes().get(1) == Some(&b':'))
 }
 
 fn is_forbidden_wrapper(name: &str) -> bool {
@@ -922,6 +942,18 @@ mod tests {
             err,
             Error::PolicyViolation {
                 code: PolicyCode::MergeBlocked,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn policy_rejects_path_qualified_script() {
+        let err = check_command_policy("./tools/run", &[], &RunOptions::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
                 ..
             }
         ));

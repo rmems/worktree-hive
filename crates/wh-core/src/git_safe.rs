@@ -82,7 +82,13 @@ const ALLOWED_GH_SUBCOMMANDS: &[&str] = &[
 ///
 /// `update-branch` defaults to a merge commit unless `--rebase` is passed; hive policy
 /// rejects merge-style updates entirely (and `--rebase` is already a blocked flag).
-const BLOCKED_GH_PR_SUBSUBCOMMANDS: &[&str] = &["merge", "ready", "update-branch"];
+const BLOCKED_GH_PR_SUBSUBCOMMANDS: &[&str] = &[
+    "merge",
+    "ready",
+    "update-branch",
+    // Switches the worktree to the PR branch; leaves assigned job branch.
+    "checkout",
+];
 
 /// `gh pr` flags that are blocked (direct merge-related flags).
 const BLOCKED_GH_FLAGS: &[&str] = &["--merge", "--squash", "--rebase", "--auto", "--admin"];
@@ -175,6 +181,13 @@ impl SafeGitCommand {
                     message:
                         "git push --delete / delete refspecs are not allowed under hive policy"
                             .to_owned(),
+                });
+            }
+            // `--prune` deletes remote refs absent locally under a matching refspec.
+            if args.iter().any(|a| a == "--prune") {
+                return Err(Error::PolicyViolation {
+                    code: PolicyCode::BareForcePush,
+                    message: "git push --prune is not allowed under hive policy".to_owned(),
                 });
             }
         }
@@ -477,7 +490,7 @@ fn reject_external_write_targets(subcommand: &str, args: &[String]) -> Result<()
     match subcommand {
         "clone" => {
             reject_external_path(clone_destination(args), "git clone destination")?;
-            // Also reject absolute --separate-git-dir paths.
+            // Also reject absolute --separate-git-dir paths and command-valued -c/--config.
             let mut i = 0;
             while i < args.len() {
                 let a = args[i].as_str();
@@ -491,6 +504,17 @@ fn reject_external_write_targets(subcommand: &str, args: &[String]) -> Result<()
                 if let Some(path) = a.strip_prefix("--separate-git-dir=") {
                     reject_external_path(Some(path), "git clone --separate-git-dir")?;
                 }
+                if a == "-c" || a == "--config" {
+                    if let Some(kv) = args.get(i + 1) {
+                        reject_command_valued_config_assignment(kv)?;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if let Some(kv) = a.strip_prefix("--config=") {
+                    reject_command_valued_config_assignment(kv)?;
+                }
+                // Attached rare form not used by git for -c; skip.
                 i += 1;
             }
         }
@@ -657,8 +681,15 @@ fn gh_repo_clone_destination(args: &[String]) -> Option<&str> {
 }
 
 fn path_is_external(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    // Unix absolute, parent traversal, Windows drive-letter, root-relative, UNC.
     path.starts_with('/')
+        || path.starts_with('\\')
         || path.contains("..")
+        || path.starts_with("//")
+        || path.starts_with("\\\\")
         || (path.len() > 2 && path.as_bytes().get(1) == Some(&b':'))
 }
 
@@ -868,6 +899,10 @@ fn is_command_launching_config_key(key: &str) -> bool {
     if k.starts_with("alias.") || k.starts_with("filter.") || k.contains(".cmd") {
         return true;
     }
+    // credential.helper and URL-scoped credential.<url>.helper
+    if k == "credential.helper" || (k.starts_with("credential.") && k.ends_with(".helper")) {
+        return true;
+    }
     matches!(
         k.as_str(),
         "core.sshcommand"
@@ -881,12 +916,28 @@ fn is_command_launching_config_key(key: &str) -> bool {
             | "diff.external"
             | "diff.tool"
             | "merge.tool"
-            | "credential.helper"
             | "uploadpack.packobjectshook"
             | "trace2.eventtarget"
             | "trace2.normaltarget"
             | "trace2.perftarget"
     )
+}
+
+/// Reject `key=value` (or bare key) config assignments that launch commands.
+fn reject_command_valued_config_assignment(kv: &str) -> Result<()> {
+    let key = kv.split_once('=').map(|(k, _)| k).unwrap_or(kv).trim();
+    if key.is_empty() {
+        return Ok(());
+    }
+    if is_command_launching_config_key(key) {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::SubcommandNotAllowed,
+            message: format!(
+                "git config key `{key}` can launch external commands and is not allowed"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Extract `-R` / `--repo` / `--repo=` selector from a `gh` argv (including `pr` etc.).
@@ -1344,6 +1395,90 @@ mod tests {
             "clone".to_owned(),
             "cli/cli".to_owned(),
             "/tmp/outside".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gh_pr_checkout_rejected() {
+        let err = SafeGhCommand::new(&["pr".to_owned(), "checkout".to_owned(), "1".to_owned()])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::MergeBlocked,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn config_url_scoped_credential_helper_rejected() {
+        let err = SafeGitCommand::new(&[
+            "config".to_owned(),
+            "credential.https://github.com.helper".to_owned(),
+            "!true".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn push_prune_rejected() {
+        let err = SafeGitCommand::new(&[
+            "push".to_owned(),
+            "--prune".to_owned(),
+            "origin".to_owned(),
+            "refs/heads/*:refs/heads/*".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::BareForcePush,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn clone_c_ssh_command_rejected() {
+        let err = SafeGitCommand::new(&[
+            "clone".to_owned(),
+            "-c".to_owned(),
+            "core.sshCommand=sh -c true".to_owned(),
+            "https://example.com/r.git".to_owned(),
+            "dst".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn windows_unc_clone_dest_rejected() {
+        let err = SafeGitCommand::new(&[
+            "clone".to_owned(),
+            "https://example.com/r.git".to_owned(),
+            r"\\server\share\out".to_owned(),
         ])
         .unwrap_err();
         assert!(matches!(
