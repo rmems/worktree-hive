@@ -62,15 +62,26 @@ impl WorktreeManager {
         job_id: &str,
         branch: &str,
     ) -> Result<Worktree> {
+        // Reject option-looking branch names (would be parsed as git flags).
+        if branch.is_empty() || branch.starts_with('-') {
+            return Err(Error::GitCommand {
+                args: vec!["worktree".into(), "add".into()],
+                stderr: format!("invalid branch name (empty or option-looking): {branch:?}"),
+            });
+        }
+
         let base = self.base_path()?;
+        // Reject symlinked components under the sandbox base so add cannot escape.
+        reject_symlink_components(base)?;
         let worktree_path = derive_worktree_path(base, owner, repo, job_id)?;
 
-        // Ensure parent directories exist
+        // Ensure parent directories exist (after symlink check on base).
         if let Some(parent) = worktree_path.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::Io {
                 context: "create worktree parent directories",
                 source: e,
             })?;
+            reject_symlink_components(parent)?;
         }
 
         // Verify the repo_root is a valid git repository
@@ -81,14 +92,16 @@ impl WorktreeManager {
             });
         }
 
-        // Verify the branch exists or can be created
+        // Create branch from HEAD only if missing; remember for rollback on failure.
         let branch_exists = branch_exists_in_repo(repo_root, branch)?;
-        if !branch_exists {
-            // Try to create the branch from HEAD
+        let created_branch = if !branch_exists {
             create_branch(repo_root, branch)?;
-        }
+            true
+        } else {
+            false
+        };
 
-        // Run `git worktree add`
+        // Run `git worktree add` (path and branch after `--`).
         let output = Command::new("git")
             .arg("-C")
             .arg(repo_root)
@@ -104,6 +117,16 @@ impl WorktreeManager {
             })?;
 
         if !output.status.success() {
+            if created_branch {
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(repo_root)
+                    .arg("branch")
+                    .arg("-D")
+                    .arg("--")
+                    .arg(branch)
+                    .output();
+            }
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(Error::GitCommand {
                 args: vec![
@@ -364,14 +387,42 @@ fn find_repo_root_for_worktree(worktree_path: &Path) -> Result<PathBuf> {
     let git_dir = String::from_utf8_lossy(&output.stdout).into_owned();
     let git_dir_path = PathBuf::from(git_dir.trim());
 
-    // For worktrees, the common dir is the main repo's .git directory
-    // The repo root is the parent of .git
+    // For worktrees, the common dir is the main repo's .git directory.
+    // The repo root is the parent of .git (never panic on malformed paths).
     if git_dir_path.ends_with(".git") {
-        Ok(git_dir_path.parent().unwrap().to_path_buf())
+        git_dir_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| Error::GitCommand {
+                args: vec!["rev-parse".into(), "--git-common-dir".into()],
+                stderr: format!("invalid git directory path: {}", git_dir_path.display()),
+            })
     } else {
         // Bare repo case
         Ok(git_dir_path)
     }
+}
+
+/// Reject any symlink component under `path` so worktree add cannot escape the sandbox.
+fn reject_symlink_components(path: &Path) -> Result<()> {
+    let mut cur = PathBuf::new();
+    for comp in path.components() {
+        cur.push(comp);
+        if cur.exists() {
+            let meta = fs::symlink_metadata(&cur).map_err(|e| Error::Io {
+                context: "stat path component for symlink check",
+                source: e,
+            })?;
+            if meta.file_type().is_symlink() {
+                return Err(Error::SandboxViolation {
+                    base: path.to_path_buf(),
+                    candidate: cur,
+                    reason: "symlink component under worktree base is not allowed",
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Check if a path is within the base directory (sandbox check).
