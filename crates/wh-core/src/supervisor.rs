@@ -34,6 +34,9 @@ use crate::git_safe::{SafeGhCommand, SafeGitCommand};
 /// How long to wait for the child to exit after a timeout kill.
 const POST_KILL_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Cap captured stdout/stderr per stream to avoid memory exhaustion.
+const MAX_CAPTURE_BYTES: usize = 1_048_576;
+
 /// Stable supervisor failure classifications (v1, additive on the wire).
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -185,11 +188,50 @@ impl Supervisor {
     ) -> Result<SupervisedOutput> {
         // Allowlist / structural validation only (no branch TOCTOU window before queue).
         let prepared = prepare_supervised_command(program, args, options)?;
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .expect("supervisor semaphore closed");
+        let started = Instant::now();
+
+        // Wall-clock timeout includes permit wait so saturated pools still time out.
+        let permit = match timeout {
+            Some(limit) => match tokio::time::timeout(limit, self.semaphore.acquire()).await {
+                Ok(Ok(p)) => p,
+                Ok(Err(_)) => panic!("supervisor semaphore closed"),
+                Err(_) => {
+                    return Ok(SupervisedOutput {
+                        exit_code: None,
+                        timed_out: true,
+                        killed: false,
+                        stdout: String::new(),
+                        stderr: "timed out waiting for max-parallel permit".to_owned(),
+                        error_code: Some(SupervisorErrorCode::TimedOut),
+                    });
+                }
+            },
+            None => self
+                .semaphore
+                .acquire()
+                .await
+                .expect("supervisor semaphore closed"),
+        };
+        let _permit = permit;
+
+        // Remaining time for the child after queueing (if any).
+        let child_timeout = timeout.map(|limit| {
+            let elapsed = started.elapsed();
+            if elapsed >= limit {
+                return Duration::from_millis(0);
+            }
+            limit.saturating_sub(elapsed)
+        });
+        if child_timeout == Some(Duration::from_millis(0)) {
+            return Ok(SupervisedOutput {
+                exit_code: None,
+                timed_out: true,
+                killed: false,
+                stdout: String::new(),
+                stderr: "timed out waiting for max-parallel permit".to_owned(),
+                error_code: Some(SupervisorErrorCode::TimedOut),
+            });
+        }
 
         // Branch check immediately before spawn, while holding the permit.
         if let Some(ref check) = prepared.branch_check {
@@ -203,7 +245,7 @@ impl Supervisor {
                 &prepared.program,
                 &prepared.args,
                 prepared.cwd.as_deref(),
-                timeout,
+                child_timeout,
             )
             .await;
         guard.defuse();
@@ -249,7 +291,7 @@ impl Supervisor {
         #[cfg(unix)]
         set_process_group(&mut cmd);
 
-        let mut child = match cmd.spawn() {
+        let child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
                 return SupervisedOutput {
@@ -416,7 +458,8 @@ fn prepare_supervised_command(
     match name.as_str() {
         "git" => {
             let safe = SafeGitCommand::new(&owned_args)?;
-            let repo = options.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+            // Always spawn PATH `git`, never a user-supplied path-qualified binary.
+            let repo = resolve_supervised_repo(options.repo.as_deref())?;
             let branch_check = if safe.requires_branch_check() {
                 let expected =
                     options
@@ -436,7 +479,7 @@ fn prepare_supervised_command(
                 None
             };
             Ok(PreparedCommand {
-                program: program.to_owned(),
+                program: "git".to_owned(),
                 args: owned_args,
                 cwd: Some(repo),
                 branch_check,
@@ -444,8 +487,9 @@ fn prepare_supervised_command(
         }
         "gh" => {
             let _safe = SafeGhCommand::new(&owned_args)?;
+            // Always spawn PATH `gh`, never a user-supplied path-qualified binary.
             Ok(PreparedCommand {
-                program: program.to_owned(),
+                program: "gh".to_owned(),
                 args: owned_args,
                 cwd: None,
                 branch_check: None,
@@ -477,7 +521,65 @@ fn is_forbidden_wrapper(name: &str) -> bool {
             | "stdbuf"
             | "timeout"
             | "time"
+            | "setsid"
+            | "open"
+            | "xdg-open"
+            | "script"
+            | "unshare"
+            | "nsenter"
+            | "chroot"
+            | "sudo"
+            | "doas"
+            | "su"
     )
+}
+
+/// Resolve and validate `--repo` for supervised git (cwd + branch checks).
+///
+/// - Rejects `..` path components in the input.
+/// - Canonicalizes to an existing directory.
+/// - When `WH_WORKTREE_BASE` is set, requires the path to stay under that base
+///   (after canonicalize) to prevent arbitrary-directory git mutations.
+fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {
+    use std::path::{Component, Path};
+
+    let raw = repo.unwrap_or_else(|| Path::new("."));
+    if raw.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(Error::SandboxViolation {
+            base: PathBuf::from("repo"),
+            candidate: raw.to_path_buf(),
+            reason: "parent-directory components are not allowed in --repo",
+        });
+    }
+
+    let canon = raw.canonicalize().map_err(|e| Error::Io {
+        context: "canonicalize supervised --repo",
+        source: e,
+    })?;
+    if !canon.is_dir() {
+        return Err(Error::SandboxViolation {
+            base: PathBuf::from("repo"),
+            candidate: canon,
+            reason: "supervised --repo must be an existing directory",
+        });
+    }
+
+    if let Some(base) = std::env::var_os("WH_WORKTREE_BASE").filter(|v| !v.is_empty()) {
+        let base_path = PathBuf::from(base);
+        let base_canon = base_path.canonicalize().map_err(|e| Error::Io {
+            context: "canonicalize WH_WORKTREE_BASE",
+            source: e,
+        })?;
+        if !canon.starts_with(&base_canon) {
+            return Err(Error::SandboxViolation {
+                base: base_canon,
+                candidate: canon,
+                reason: "supervised --repo escapes WH_WORKTREE_BASE",
+            });
+        }
+    }
+
+    Ok(canon)
 }
 
 async fn timeout_output(
@@ -487,10 +589,8 @@ async fn timeout_output(
 ) -> SupervisedOutput {
     let _ = child.kill().await;
     // Bound how long we wait for the killed child and pipe readers.
+    // Prefer letting readers finish after pipes close so partial output is preserved.
     let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
-    // Abort pipe readers so they do not outlive the session as detached tasks.
-    stdout_handle.abort();
-    stderr_handle.abort();
     let stdout = join_with_timeout(stdout_handle).await;
     let stderr = join_with_timeout(stderr_handle).await;
     SupervisedOutput {
@@ -541,7 +641,23 @@ async fn read_pipe<R: AsyncReadExt + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
     match pipe.as_mut() {
         Some(reader) => {
             let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf).await;
+            let mut chunk = [0u8; 8192];
+            loop {
+                if buf.len() >= MAX_CAPTURE_BYTES {
+                    break;
+                }
+                match reader.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let room = MAX_CAPTURE_BYTES.saturating_sub(buf.len());
+                        buf.extend_from_slice(&chunk[..n.min(room)]);
+                        if n > room {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
             buf
         }
         None => Vec::new(),
@@ -669,6 +785,19 @@ mod tests {
     #[test]
     fn policy_rejects_shell_wrappers() {
         let err = check_command_policy("sh", &["-c", "gh pr merge 1"], &RunOptions::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn policy_rejects_setsid_launcher() {
+        let err = check_command_policy("setsid", &["gh", "pr", "merge"], &RunOptions::default())
             .unwrap_err();
         assert!(matches!(
             err,

@@ -165,7 +165,13 @@ async fn run_supervisor(
     match supervisor.run(program, &args, timeout, &options).await {
         Ok(output) => {
             write_supervisor_result(json, Ok(&output), stdout)?;
-            Ok(supervised_exit_code(&output))
+            if json {
+                // Machine clients (WhClient) parse stdout only on exit 0 (except policy=2).
+                // Structured success/failure lives in the envelope (`ok`, `data`, `error`).
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Ok(supervised_exit_code(&output))
+            }
         }
         Err(err) => {
             write_supervisor_result(json, Err(&err), stdout)?;
@@ -620,7 +626,7 @@ mod tests {
                     cmd: {
                         #[cfg(windows)]
                         {
-                            vec!["where.exe".to_owned()]
+                            vec!["where.exe".to_owned(), "where.exe".to_owned()]
                         }
                         #[cfg(not(windows))]
                         {
@@ -740,7 +746,8 @@ mod tests {
         };
         let mut stdout = Vec::new();
         let code = run(cli, &mut stdout).await.unwrap();
-        assert_ne!(code, ExitCode::SUCCESS);
+        // JSON mode always exits 0 when the envelope was written; status is in `ok`/`data`.
+        assert_eq!(code, ExitCode::SUCCESS);
         let v: serde_json::Value =
             serde_json::from_str(str::from_utf8(&stdout).unwrap().trim()).unwrap();
         assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(false));
@@ -793,7 +800,7 @@ mod tests {
                     cmd: {
                         #[cfg(windows)]
                         {
-                            vec!["where.exe".to_owned()]
+                            vec!["where.exe".to_owned(), "where.exe".to_owned()]
                         }
                         #[cfg(not(windows))]
                         {
