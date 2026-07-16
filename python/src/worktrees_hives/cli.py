@@ -9,12 +9,13 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
+from worktrees_hives.errors import PolicyError
 from worktrees_hives.watchlist import (
     CorruptStateError,
     JobState,
     JobStatus,
-    PolicyError,
     Watchlist,
 )
 
@@ -30,48 +31,8 @@ def _print_job(job: JobState) -> None:
 
 
 def _watchlist_from_args(args: argparse.Namespace) -> Watchlist:
-    """Build Watchlist from CLI args; honors --state or WH_STATE_PATH default."""
+    """Build Watchlist from CLI args; honors --state or WH_WATCHLIST_PATH default."""
     return Watchlist(Path(args.state) if args.state else None)
-
-
-def cmd_add(args: argparse.Namespace) -> int:
-    """Handle watchlist add command."""
-    try:
-        w = _watchlist_from_args(args)
-        job = w.add(
-            job_id=args.job_id,
-            owner=args.owner,
-            repo=args.repo,
-            branch=args.branch,
-            stack_id=args.stack_id,
-            max_fixes=args.max_fixes,
-        )
-        print(f"Added job {job.job_id} to watchlist")
-        return 0
-    except CorruptStateError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-    except PolicyError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 2
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-
-
-def cmd_remove(args: argparse.Namespace) -> int:
-    """Handle watchlist remove command."""
-    try:
-        w = _watchlist_from_args(args)
-        w.remove(args.job_id)
-        print(f"Removed job {args.job_id} from watchlist")
-        return 0
-    except CorruptStateError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-    except KeyError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
 
 
 def _v1_envelope(
@@ -91,46 +52,141 @@ def _v1_envelope(
     }
 
 
-def cmd_list(args: argparse.Namespace) -> int:
-    """Handle watchlist list command."""
+def _job_to_json(job: JobState) -> dict[str, Any]:
+    """Serialize a JobState for JSON envelopes (list/check items)."""
+    return {
+        "job_id": job.job_id,
+        "owner": job.owner,
+        "repo": job.repo,
+        "branch": job.branch,
+        "status": job.status.value,
+        "pr_number": job.pr_number,
+        "pr_url": job.pr_url,
+        "fix_count": job.fix_count,
+        "max_fixes": job.max_fixes,
+        "fix_budget_remaining": job.fix_budget_remaining,
+        "babysit_cycle": job.babysit_cycle,
+        "residual_blockers": list(job.residual_blockers),
+        "last_check": job.last_check,
+        "error": job.error,
+    }
+
+
+def _emit_corrupt(command: str, err: CorruptStateError, *, as_json: bool) -> int:
+    print(f"Error: {err}", file=sys.stderr)
+    if as_json:
+        empty: dict[str, object] = {"jobs": []} if "list" in command else {"categories": {}}
+        if "add" in command:
+            empty = {}
+        elif "remove" in command:
+            empty = {"job_id": None}
+        print(
+            json.dumps(
+                _v1_envelope(
+                    command,
+                    empty,
+                    ok=False,
+                    error={"code": "CORRUPT_STATE", "message": str(err)},
+                )
+            )
+        )
+    return 1
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    """Handle watchlist add command."""
+    as_json = getattr(args, "json", False)
     try:
         w = _watchlist_from_args(args)
+        job = w.add(
+            job_id=args.job_id,
+            owner=args.owner,
+            repo=args.repo,
+            branch=args.branch,
+            stack_id=args.stack_id,
+            max_fixes=args.max_fixes,
+        )
+        if as_json:
+            print(json.dumps(_v1_envelope("watchlist.add", {"job": _job_to_json(job)})))
+        else:
+            print(f"Added job {job.job_id} to watchlist")
+        return 0
     except CorruptStateError as e:
+        return _emit_corrupt("watchlist.add", e, as_json=as_json)
+    except PolicyError as e:
         print(f"Error: {e}", file=sys.stderr)
-        if getattr(args, "json", False):
+        if as_json:
             print(
                 json.dumps(
                     _v1_envelope(
-                        "watchlist.list",
-                        {"jobs": []},
+                        "watchlist.add",
+                        {},
                         ok=False,
-                        error={"code": "CORRUPT_STATE", "message": str(e)},
+                        error={"code": e.code, "message": e.message},
+                    )
+                )
+            )
+        return 2
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        if as_json:
+            print(
+                json.dumps(
+                    _v1_envelope(
+                        "watchlist.add",
+                        {},
+                        ok=False,
+                        error={"code": "VALUE_ERROR", "message": str(e)},
                     )
                 )
             )
         return 1
-    status_filter = JobStatus(args.status) if args.status else None
-    jobs = w.list_jobs(owner=args.owner, repo=args.repo, status=status_filter)
-    if getattr(args, "json", False):
-        payload = [
-            {
-                "job_id": j.job_id,
-                "owner": j.owner,
-                "repo": j.repo,
-                "branch": j.branch,
-                "status": j.status.value,
-                "pr_number": j.pr_number,
-                "pr_url": j.pr_url,
-                "fix_count": j.fix_count,
-                "max_fixes": j.max_fixes,
-                "babysit_cycle": j.babysit_cycle,
-                "residual_blockers": list(j.residual_blockers),
-                "last_check": j.last_check,
-                "error": j.error,
-            }
-            for j in jobs
-        ]
-        print(json.dumps(_v1_envelope("watchlist.list", {"jobs": payload})))
+
+
+def cmd_remove(args: argparse.Namespace) -> int:
+    """Handle watchlist remove command."""
+    as_json = getattr(args, "json", False)
+    try:
+        w = _watchlist_from_args(args)
+        w.remove(args.job_id)
+        if as_json:
+            print(
+                json.dumps(
+                    _v1_envelope("watchlist.remove", {"job_id": args.job_id, "removed": True})
+                )
+            )
+        else:
+            print(f"Removed job {args.job_id} from watchlist")
+        return 0
+    except CorruptStateError as e:
+        return _emit_corrupt("watchlist.remove", e, as_json=as_json)
+    except KeyError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        if as_json:
+            print(
+                json.dumps(
+                    _v1_envelope(
+                        "watchlist.remove",
+                        {"job_id": args.job_id, "removed": False},
+                        ok=False,
+                        error={"code": "NOT_FOUND", "message": str(e)},
+                    )
+                )
+            )
+        return 1
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    """Handle watchlist list command."""
+    as_json = getattr(args, "json", False)
+    try:
+        w = _watchlist_from_args(args)
+        status_filter = JobStatus(args.status) if args.status else None
+        jobs = w.list_jobs(owner=args.owner, repo=args.repo, status=status_filter)
+    except CorruptStateError as e:
+        return _emit_corrupt("watchlist.list", e, as_json=as_json)
+    if as_json:
+        print(json.dumps(_v1_envelope("watchlist.list", {"jobs": [_job_to_json(j) for j in jobs]})))
         return 0
     if not jobs:
         print("No jobs in watchlist")
@@ -142,40 +198,15 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 def cmd_check(args: argparse.Namespace) -> int:
     """Handle watchlist check command."""
+    as_json = getattr(args, "json", False)
     try:
         w = _watchlist_from_args(args)
+        # check() may stamp last_check and _save(); catch write failures too.
+        categories = w.check(owner=args.owner, repo=args.repo)
     except CorruptStateError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        if getattr(args, "json", False):
-            print(
-                json.dumps(
-                    _v1_envelope(
-                        "watchlist.check",
-                        {"categories": {}},
-                        ok=False,
-                        error={"code": "CORRUPT_STATE", "message": str(e)},
-                    )
-                )
-            )
-        return 1
-    categories = w.check(owner=args.owner, repo=args.repo)
-    if getattr(args, "json", False):
-        data = {
-            cat: [
-                {
-                    "job_id": j.job_id,
-                    "owner": j.owner,
-                    "repo": j.repo,
-                    "branch": j.branch,
-                    "status": j.status.value,
-                    "pr_number": j.pr_number,
-                    "error": j.error,
-                    "last_check": j.last_check,
-                }
-                for j in jobs
-            ]
-            for cat, jobs in categories.items()
-        }
+        return _emit_corrupt("watchlist.check", e, as_json=as_json)
+    if as_json:
+        data = {cat: [_job_to_json(j) for j in jobs] for cat, jobs in categories.items()}
         print(json.dumps(_v1_envelope("watchlist.check", {"categories": data})))
         return 0
     has_work = False
@@ -200,7 +231,8 @@ def main(argv: list[str] | None = None) -> int:
         "--state",
         help=(
             "Path to watchlist state file "
-            "(default: WH_WATCHLIST_PATH / WH_STATE_PATH / platform data dir/watchlist.json)"
+            "(default: WH_WATCHLIST_PATH or platform data dir/watchlist.json; "
+            "never WH_STATE_PATH / Rust watched.json)"
         ),
     )
     parser.add_argument(

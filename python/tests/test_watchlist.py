@@ -7,12 +7,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from worktrees_hives.errors import PolicyError
 from worktrees_hives.watchlist import (
     ALLOWED_OWNERS,
     CorruptStateError,
     JobState,
     JobStatus,
-    PolicyError,
     Watchlist,
     _atomic_write_json,
     _default_state_path,
@@ -61,14 +61,29 @@ class TestAtomicWrite:
 
 
 class TestDefaultStatePath:
-    def test_honors_wh_state_path(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        custom = tmp_path / "custom-watchlist.json"
-        monkeypatch.setenv("WH_STATE_PATH", str(custom))
-        assert _default_state_path() == custom
-
-    def test_default_filename_is_watched_json(
+    def test_honors_wh_watchlist_path(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        custom = tmp_path / "custom-watchlist.json"
+        monkeypatch.setenv("WH_WATCHLIST_PATH", str(custom))
+        monkeypatch.setenv("WH_STATE_PATH", str(tmp_path / "rust-watched.json"))
+        assert _default_state_path() == custom
+
+    def test_ignores_wh_state_path_alone(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """WH_STATE_PATH is Rust watched.json — must not redirect the Python store."""
+        monkeypatch.delenv("WH_WATCHLIST_PATH", raising=False)
+        monkeypatch.setenv("WH_STATE_PATH", str(tmp_path / "rust-watched.json"))
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+        path = _default_state_path()
+        assert path.name == "watchlist.json"
+        assert path != tmp_path / "rust-watched.json"
+
+    def test_default_filename_is_watchlist_json(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.delenv("WH_WATCHLIST_PATH", raising=False)
         monkeypatch.delenv("WH_STATE_PATH", raising=False)
         monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
         path = _default_state_path()
@@ -99,8 +114,9 @@ class TestWatchlistAdd:
             watchlist.add("j1", "acme", "repo", "br", max_fixes=-1)
 
     def test_add_exceeds_safety_ceiling_raises(self, watchlist: Watchlist) -> None:
-        with pytest.raises(PolicyError, match="safety ceiling"):
+        with pytest.raises(PolicyError, match="safety ceiling") as exc_info:
             watchlist.add("j1", "acme", "repo", "br", max_fixes=5)
+        assert exc_info.value.code == "MAX_FIXES_CEILING"
 
     def test_add_duplicate_raises(self, watchlist: Watchlist) -> None:
         watchlist.add("j1", "acme", "repo", "br")
@@ -610,6 +626,18 @@ class TestCheckEdgeCases:
         assert result["needs_pr"] == []
         assert len(result["in_progress"]) == 1
 
+    def test_in_progress_with_blockers_defers_fixes(self, watchlist: Watchlist) -> None:
+        """Active fix worker must not re-enter needs_fix even with residual blockers."""
+        watchlist.add("j1", "acme", "r1", "br")
+        watchlist.set_pr("j1", 42, "https://example.com/pr/42")
+        watchlist.set_blockers("j1", ["ci failing"])
+        watchlist.update_status("j1", JobStatus.IN_PROGRESS)
+        result = watchlist.check(record=False)
+        assert result["needs_fix"] == []
+        assert result["blocked"] == []
+        assert len(result["in_progress"]) == 1
+        assert result["in_progress"][0].job_id == "j1"
+
     def test_check_preserves_error(self, watchlist: Watchlist) -> None:
         watchlist.add("j1", "acme", "r1", "br")
         watchlist.record_check("j1", error="boom")
@@ -642,3 +670,69 @@ class TestCheckEdgeCases:
         d.mkdir()
         with pytest.raises(CorruptStateError, match=r"Cannot read|Cannot write|Cannot create"):
             Watchlist(d, allowed_owners=_TEST_OWNERS)
+
+
+class TestCliJsonEnvelopes:
+    """--json emits v1 envelopes for mutations and check categories."""
+
+    def test_json_add_and_remove(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from worktrees_hives.cli import main
+
+        monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme")
+        state = str(tmp_path / "watchlist.json")
+        assert (
+            main(
+                [
+                    "--json",
+                    "--state",
+                    state,
+                    "watchlist",
+                    "add",
+                    "j1",
+                    "acme",
+                    "repo",
+                    "br",
+                ]
+            )
+            == 0
+        )
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload["ok"] is True
+        assert payload["schema_version"] == 1
+        assert payload["command"] == "watchlist.add"
+        assert payload["data"]["job"]["job_id"] == "j1"
+        assert "Added job" not in out
+
+        assert main(["--json", "--state", state, "watchlist", "remove", "j1"]) == 0
+        out2 = capsys.readouterr().out
+        rem = json.loads(out2)
+        assert rem["ok"] is True
+        assert rem["command"] == "watchlist.remove"
+        assert rem["data"]["removed"] is True
+        assert "Removed job" not in out2
+
+    def test_json_check_includes_blockers_and_budget(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from worktrees_hives.cli import main
+
+        monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme")
+        state = tmp_path / "watchlist.json"
+        w = Watchlist(state, allowed_owners=_TEST_OWNERS)
+        w.add("j1", "acme", "repo", "br")
+        w.set_pr("j1", 7, "https://example.com/pr/7")
+        w.set_blockers("j1", ["ruff", "review"])
+        assert main(["--json", "--state", str(state), "watchlist", "check"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is True
+        assert payload["command"] == "watchlist.check"
+        needs = payload["data"]["categories"]["needs_fix"]
+        assert len(needs) == 1
+        item = needs[0]
+        assert item["residual_blockers"] == ["ruff", "review"]
+        assert item["fix_count"] == 0
+        assert item["max_fixes"] == 3
+        assert item["fix_budget_remaining"] == 3

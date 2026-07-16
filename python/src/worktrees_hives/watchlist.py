@@ -13,13 +13,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from worktrees_hives.errors import PolicyError
+
 # Python orchestrator watchlist store (separate from Rust `watched.json`).
 # Rust `wh status`/`wh jobs` expect a JSON *array* of JobStatus at WH_STATE_PATH/
 # watched.json (see crates/wh-core/src/state.rs). This module persists a
 # Python-side map envelope; do not share the same file until schemas unify.
-# Override path with WH_WATCHLIST_PATH (preferred) or WH_STATE_PATH for tests.
+# Override path with WH_WATCHLIST_PATH only (never WH_STATE_PATH — that is Rust).
 STATE_FILENAME = "watchlist.json"
-WH_STATE_PATH_ENV = "WH_STATE_PATH"
 WH_WATCHLIST_PATH_ENV = "WH_WATCHLIST_PATH"
 WH_ALLOWED_OWNERS_ENV = "WH_ALLOWED_OWNERS"
 MAX_FIXES_CEILING = 3
@@ -43,10 +44,6 @@ class JobStatus(str, Enum):
     BLOCKED = "blocked"
     COMPLETED = "completed"
     FAILED = "failed"
-
-
-class PolicyError(ValueError):
-    """Safety-policy rejection (maps to CLI exit code 2)."""
 
 
 class CorruptStateError(ValueError):
@@ -114,13 +111,12 @@ def _platform_data_dir() -> Path:
 def _default_state_path() -> Path:
     """Return the default Python watchlist state file path.
 
-    Honors WH_WATCHLIST_PATH, then WH_STATE_PATH (tests/legacy), else
-    platform data dir + watchlist.json (not Rust watched.json).
+    Honors WH_WATCHLIST_PATH only. Never falls back to WH_STATE_PATH
+    (Rust array-backed watched.json). Pass an explicit path or --state for tests.
     """
-    for key in (WH_WATCHLIST_PATH_ENV, WH_STATE_PATH_ENV):
-        env_path = os.environ.get(key)
-        if env_path:
-            return Path(env_path)
+    env_path = os.environ.get(WH_WATCHLIST_PATH_ENV)
+    if env_path:
+        return Path(env_path)
     return _platform_data_dir() / STATE_FILENAME
 
 
@@ -199,8 +195,9 @@ def _validate_max_fixes(max_fixes: int) -> int:
         raise ValueError("max_fixes must be non-negative")
     if max_fixes > MAX_FIXES_CEILING:
         raise PolicyError(
+            "MAX_FIXES_CEILING",
             f"max_fixes ({max_fixes}) exceeds safety ceiling ({MAX_FIXES_CEILING}). "
-            "Per AGENTS.md, at most 3 code-fix commits per PR per cycle."
+            "Per AGENTS.md, at most 3 code-fix commits per PR per cycle.",
         )
     return max_fixes
 
@@ -225,8 +222,8 @@ class Watchlist:
     """Persistent watchlist for multi-job hive state.
 
     State is stored as JSON at a configurable path (default: platform data dir /
-    watchlist.json, or WH_WATCHLIST_PATH / WH_STATE_PATH). Writes are atomic
-    (temp file + rename). Separate from Rust ``watched.json`` array store.
+    watchlist.json, or WH_WATCHLIST_PATH). Writes are atomic (temp file + rename).
+    Separate from Rust ``watched.json`` array store (never shares WH_STATE_PATH).
     """
 
     def __init__(
@@ -363,7 +360,10 @@ class Watchlist:
                 if allow
                 else f"set {WH_ALLOWED_OWNERS_ENV} or pass allowed_owners="
             )
-            raise PolicyError(f"Owner {owner!r} not in allowlist ({hint})")
+            raise PolicyError(
+                "OWNER_NOT_ALLOWED",
+                f"Owner {owner!r} not in allowlist ({hint})",
+            )
         if job_id in self._jobs:
             raise ValueError(f"Job {job_id!r} already exists in watchlist")
         # Promoting a previously deferred id into active set.
@@ -466,8 +466,9 @@ class Watchlist:
         effective_max = min(job.max_fixes, MAX_FIXES_CEILING)
         if job.fix_count >= effective_max:
             raise PolicyError(
+                "FIX_BUDGET_EXHAUSTED",
                 f"Job {job_id!r} has exhausted its fix budget "
-                f"({effective_max}; ceiling {MAX_FIXES_CEILING})"
+                f"({effective_max}; ceiling {MAX_FIXES_CEILING})",
             )
         job.fix_count += 1
         self._save()
@@ -522,8 +523,8 @@ class Watchlist:
 
         Categories:
           - needs_pr: pending/actionable job with no PR yet (not already running)
-          - needs_fix: has residual blockers and remaining fix budget
-          - in_progress: IN_PROGRESS with no PR yet (defer; do not re-queue)
+          - needs_fix: has residual blockers and remaining fix budget (not IN_PROGRESS)
+          - in_progress: IN_PROGRESS — defer; do not re-queue PR creation or fixes
           - blocked: residual blockers with exhausted budget, or explicit BLOCKED status
           - ready: has PR, no residual blockers (awaiting merge / healthy)
           - done: COMPLETED or FAILED
@@ -551,6 +552,9 @@ class Watchlist:
                 job.last_check = now
             if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
                 result["done"].append(job)
+            elif job.status == JobStatus.IN_PROGRESS:
+                # Active worker — never re-queue PR creation or concurrent fixes.
+                result["in_progress"].append(job)
             elif job.residual_blockers:
                 if job.fix_budget_remaining > 0 and job.status != JobStatus.BLOCKED:
                     result["needs_fix"].append(job)
@@ -559,11 +563,7 @@ class Watchlist:
             elif job.status == JobStatus.BLOCKED:
                 result["blocked"].append(job)
             elif job.pr_number is None:
-                # Active worker already claimed — do not re-queue PR creation.
-                if job.status == JobStatus.IN_PROGRESS:
-                    result["in_progress"].append(job)
-                else:
-                    result["needs_pr"].append(job)
+                result["needs_pr"].append(job)
             else:
                 # Has PR, no residual blockers — ready regardless of remaining budget
                 result["ready"].append(job)
