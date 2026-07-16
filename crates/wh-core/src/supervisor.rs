@@ -445,12 +445,13 @@ fn prepare_supervised_command(
     let name = normalize_program_name(program);
     let owned_args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
 
-    // Shells and launchers are never policy-safe under substring checks; require direct binaries.
+    // Shells, interpreters, launchers, and direct network clients are never policy-safe
+    // under substring checks; require direct allowlisted binaries for sensitive actions.
     if is_forbidden_wrapper(&name) {
         return Err(Error::PolicyViolation {
             code: PolicyCode::SubcommandNotAllowed,
             message: format!(
-                "supervised program `{name}` is a shell/launcher and is not allowed; invoke git, gh, or another binary directly (no sh/env/cmd wrappers)"
+                "supervised program `{name}` can launch or tunnel unreviewed commands and is not allowed; invoke git, gh, or another binary directly"
             ),
         });
     }
@@ -458,26 +459,23 @@ fn prepare_supervised_command(
     match name.as_str() {
         "git" => {
             let safe = SafeGitCommand::new(&owned_args)?;
-            // Always spawn PATH `git`, never a user-supplied path-qualified binary.
-            let repo = resolve_supervised_repo(options.repo.as_deref())?;
-            let branch_check = if safe.requires_branch_check() {
-                let expected =
-                    options
-                        .expected_branch
-                        .clone()
-                        .ok_or_else(|| Error::PolicyViolation {
-                            code: PolicyCode::BranchMismatch,
-                            message:
-                                "mutating git commands require --expected-branch under supervisor"
-                                    .to_owned(),
-                        })?;
-                Some(BranchCheck {
-                    expected_branch: expected,
-                    repo: repo.clone(),
-                })
+            let expected = if safe.requires_branch_check() {
+                Some(options.expected_branch.clone().ok_or_else(|| {
+                    Error::PolicyViolation {
+                        code: PolicyCode::BranchMismatch,
+                        message: "mutating git commands require --expected-branch under supervisor"
+                            .to_owned(),
+                    }
+                })?)
             } else {
                 None
             };
+            // Always spawn PATH `git`, never a user-supplied path-qualified binary.
+            let repo = resolve_supervised_repo(options.repo.as_deref())?;
+            let branch_check = expected.map(|expected_branch| BranchCheck {
+                expected_branch,
+                repo: repo.clone(),
+            });
             Ok(PreparedCommand {
                 program: "git".to_owned(),
                 args: owned_args,
@@ -531,6 +529,22 @@ fn is_forbidden_wrapper(name: &str) -> bool {
             | "sudo"
             | "doas"
             | "su"
+            | "python"
+            | "python2"
+            | "python3"
+            | "py"
+            | "perl"
+            | "ruby"
+            | "node"
+            | "deno"
+            | "bun"
+            | "php"
+            | "lua"
+            | "rscript"
+            | "curl"
+            | "wget"
+            | "http"
+            | "httpie"
     )
 }
 
@@ -538,10 +552,12 @@ fn is_forbidden_wrapper(name: &str) -> bool {
 ///
 /// - Rejects `..` path components in the input.
 /// - Canonicalizes to an existing directory.
-/// - When `WH_WORKTREE_BASE` is set, requires the path to stay under that base
-///   (after canonicalize) to prevent arbitrary-directory git mutations.
+/// - Requires the path to stay under `WH_WORKTREE_BASE` when set, otherwise under
+///   the documented default `{user_data_dir}/worktrees-hives/worktrees` root.
 fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {
     use std::path::{Component, Path};
+
+    let worktree_base = supervised_worktree_base();
 
     let raw = repo.unwrap_or_else(|| Path::new("."));
     if raw.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -564,22 +580,46 @@ fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {
         });
     }
 
-    if let Some(base) = std::env::var_os("WH_WORKTREE_BASE").filter(|v| !v.is_empty()) {
-        let base_path = PathBuf::from(base);
-        let base_canon = base_path.canonicalize().map_err(|e| Error::Io {
-            context: "canonicalize WH_WORKTREE_BASE",
-            source: e,
-        })?;
-        if !canon.starts_with(&base_canon) {
-            return Err(Error::SandboxViolation {
-                base: base_canon,
-                candidate: canon,
-                reason: "supervised --repo escapes WH_WORKTREE_BASE",
-            });
-        }
+    let base = normalize_existing_or_future_dir(&worktree_base)?;
+    if !canon.starts_with(&base) {
+        return Err(Error::SandboxViolation {
+            base,
+            candidate: canon,
+            reason: "supervised --repo escapes the configured worktree base",
+        });
     }
 
     Ok(canon)
+}
+
+fn supervised_worktree_base() -> PathBuf {
+    std::env::var_os("WH_WORKTREE_BASE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            crate::paths::user_data_dir()
+                .join("worktrees-hives")
+                .join("worktrees")
+        })
+}
+
+fn normalize_existing_or_future_dir(path: &std::path::Path) -> Result<PathBuf> {
+    if path.exists() {
+        return path.canonicalize().map_err(|e| Error::Io {
+            context: "canonicalize worktree base",
+            source: e,
+        });
+    }
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .map_err(|e| Error::Io {
+                context: "resolve worktree base",
+                source: e,
+            })
+    }
 }
 
 async fn timeout_output(
@@ -819,6 +859,62 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn policy_rejects_interpreter_launchers() {
+        let err = check_command_policy(
+            "python3",
+            &[
+                "-c",
+                "import subprocess; subprocess.run(['gh','pr','merge','1'])",
+            ],
+            &RunOptions::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn policy_rejects_direct_rest_clients() {
+        let err = check_command_policy(
+            "curl",
+            &[
+                "-X",
+                "PUT",
+                "https://api.github.com/repos/o/r/pulls/1/merge",
+            ],
+            &RunOptions::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mutating_git_rejects_repo_outside_default_worktree_base() {
+        let repo = std::env::temp_dir();
+        let err = check_command_policy(
+            "git",
+            &["commit", "-m", "x"],
+            &RunOptions {
+                expected_branch: Some("feature".to_owned()),
+                repo: Some(repo),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::SandboxViolation { .. }));
     }
 
     #[test]

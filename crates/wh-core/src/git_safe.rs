@@ -48,15 +48,25 @@ const ALLOWED_GIT_SUBCOMMANDS: &[&str] = &[
 
 /// Git subcommands that mutate branch state and require branch verification.
 const MUTATING_SUBCOMMANDS: &[&str] = &[
+    "add",
+    "branch",
     "checkout",
     "cherry-pick",
+    "clean",
+    "clone",
     "commit",
+    "config",
+    "mv",
     "pull",
     "push",
     "rebase",
+    "remote",
     "reset",
     "restore",
+    "rm",
+    "stash",
     "switch",
+    "tag",
 ];
 
 /// GitHub CLI subcommands allowed for hive jobs.
@@ -125,6 +135,16 @@ impl SafeGitCommand {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::BareForcePush,
                 message: "bare --force/-f is not allowed; use --force-with-lease only".to_owned(),
+            });
+        }
+
+        // Git push also accepts force via `+<src>:<dst>` refspecs. Treat those as
+        // bare force pushes so supervised jobs cannot rewrite refs without an explicit
+        // lease-protected flag.
+        if subcommand == "push" && args.iter().skip(1).any(|a| is_force_refspec(a)) {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::BareForcePush,
+                message: "force-push refspecs prefixed with `+` are not allowed; use --force-with-lease only".to_owned(),
             });
         }
 
@@ -325,6 +345,10 @@ fn is_bare_force_flag(arg: &str) -> bool {
     arg.starts_with("--force=")
 }
 
+fn is_force_refspec(arg: &str) -> bool {
+    arg.starts_with('+') && arg.len() > 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,6 +488,23 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn force_refspec_rejected() {
+        let err = SafeGitCommand::new(&[
+            "push".to_owned(),
+            "origin".to_owned(),
+            "+HEAD:main".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::BareForcePush,
+                ..
+            }
+        ));
+    }
+
     // ---- mutating subcommand detection ----
 
     #[test]
@@ -476,6 +517,18 @@ mod tests {
     fn commit_is_mutating() {
         let cmd =
             SafeGitCommand::new(&["commit".to_owned(), "-m".to_owned(), "msg".to_owned()]).unwrap();
+        assert!(cmd.requires_branch_check());
+    }
+
+    #[test]
+    fn add_is_mutating() {
+        let cmd = SafeGitCommand::new(&["add".to_owned(), ".".to_owned()]).unwrap();
+        assert!(cmd.requires_branch_check());
+    }
+
+    #[test]
+    fn clean_is_mutating() {
+        let cmd = SafeGitCommand::new(&["clean".to_owned(), "-fd".to_owned()]).unwrap();
         assert!(cmd.requires_branch_check());
     }
 
