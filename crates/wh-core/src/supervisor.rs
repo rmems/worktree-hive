@@ -168,9 +168,12 @@ impl Supervisor {
     ///
     /// - Validates git/gh (including path-qualified names like `/usr/bin/git`) via
     ///   [`SafeGitCommand`] / [`SafeGhCommand`].
-    /// - Rejects common shell wrappers that embed merge / bare-force git/gh operations.
-    /// - For mutating git, requires [`RunOptions::expected_branch`] and verifies it.
-    /// - Spawns with process-group isolation where the OS allows.
+    /// - **Rejects shells and launchers** (`sh`, `bash`, `cmd`, `env`, `xargs`, …) so policy
+    ///   cannot be bypassed by quoting or wrappers; invoke binaries directly.
+    /// - For mutating git, requires [`RunOptions::expected_branch`], verifies the branch
+    ///   **after** acquiring a permit (and immediately before spawn), and runs with
+    ///   `current_dir` set to the verified repo.
+    /// - Spawns with process-group isolation where the OS allows; Drop/timeout kill the group.
     /// - Enforces wall-clock timeout; kills the process group on expiry (Unix).
     /// - Acquires a permit from the **process-local** max-parallel semaphore before spawning.
     pub async fn run(
@@ -180,6 +183,7 @@ impl Supervisor {
         timeout: Option<Duration>,
         options: &RunOptions,
     ) -> Result<SupervisedOutput> {
+        // Allowlist / structural validation only (no branch TOCTOU window before queue).
         let prepared = prepare_supervised_command(program, args, options)?;
         let _permit = self
             .semaphore
@@ -187,16 +191,28 @@ impl Supervisor {
             .await
             .expect("supervisor semaphore closed");
 
+        // Branch check immediately before spawn, while holding the permit.
+        if let Some(ref check) = prepared.branch_check {
+            let safe = SafeGitCommand::new(&prepared.args)?;
+            safe.verify_branch(&check.repo, &check.expected_branch)?;
+        }
+
         let guard = ActiveGuard::arm(self);
         let output = self
-            .run_with_permit(&prepared.program, &prepared.args, timeout)
+            .run_with_permit(
+                &prepared.program,
+                &prepared.args,
+                prepared.cwd.as_deref(),
+                timeout,
+            )
             .await;
         guard.defuse();
         Ok(output)
     }
 
-    /// Low-level run **without** policy checks (tests / internal). Prefer [`Self::run`].
-    pub async fn run_unchecked(
+    /// Low-level run **without** policy checks — **test-only** (not part of the public API).
+    #[cfg(test)]
+    async fn run_unchecked(
         &self,
         program: &str,
         args: &[&str],
@@ -209,7 +225,7 @@ impl Supervisor {
             .await
             .expect("supervisor semaphore closed");
         let guard = ActiveGuard::arm(self);
-        let output = self.run_with_permit(program, &owned, timeout).await;
+        let output = self.run_with_permit(program, &owned, None, timeout).await;
         guard.defuse();
         output
     }
@@ -218,10 +234,14 @@ impl Supervisor {
         &self,
         program: &str,
         args: &[String],
+        cwd: Option<&std::path::Path>,
         timeout: Option<Duration>,
     ) -> SupervisedOutput {
         let mut cmd = Command::new(program);
         cmd.args(args);
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
@@ -243,12 +263,14 @@ impl Supervisor {
             }
         };
 
+        // Ensure process-group kill if this future is dropped mid-run (Unix).
         let pid = child.id();
+        let mut child = ProcessGroupChild { child, pid };
 
         // Start reading pipes concurrently to prevent deadlock when
         // the child fills the OS pipe buffer before exiting.
-        let mut child_stdout = child.stdout.take();
-        let mut child_stderr = child.stderr.take();
+        let mut child_stdout = child.child.stdout.take();
+        let mut child_stderr = child.child.stderr.take();
         let stdout_handle: JoinHandle<Vec<u8>> =
             tokio::spawn(async move { read_pipe(&mut child_stdout).await });
         let stderr_handle: JoinHandle<Vec<u8>> =
@@ -262,7 +284,7 @@ impl Supervisor {
             tokio::select! {
                 biased;
                 _ = &mut deadline => {
-                    timeout_output(pid, &mut child, stdout_handle, stderr_handle).await
+                    timeout_output(&mut child, stdout_handle, stderr_handle).await
                 }
                 status = child.wait() => {
                     match status {
@@ -310,10 +332,44 @@ impl Supervisor {
     }
 }
 
+/// Child that kills its Unix process group on Drop (in addition to tokio kill_on_drop).
+struct ProcessGroupChild {
+    child: tokio::process::Child,
+    pid: Option<u32>,
+}
+
+impl ProcessGroupChild {
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait().await
+    }
+
+    async fn kill(&mut self) -> std::io::Result<()> {
+        kill_process_group(self.pid);
+        self.child.kill().await
+    }
+}
+
+impl Drop for ProcessGroupChild {
+    fn drop(&mut self) {
+        kill_process_group(self.pid);
+        let _ = self.child.start_kill();
+    }
+}
+
+/// Deferred branch verification performed after the concurrency permit is held.
+struct BranchCheck {
+    expected_branch: String,
+    repo: PathBuf,
+}
+
 /// Normalized program + args ready to spawn after policy checks.
 struct PreparedCommand {
     program: String,
     args: Vec<String>,
+    /// Working directory for the child (verified git repo when applicable).
+    cwd: Option<PathBuf>,
+    /// When set, re-verify branch immediately before spawn (post-permit).
+    branch_check: Option<BranchCheck>,
 }
 
 /// Normalize an executable path to a basename without platform extensions.
@@ -347,27 +403,43 @@ fn prepare_supervised_command(
     let name = normalize_program_name(program);
     let owned_args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
 
+    // Shells and launchers are never policy-safe under substring checks; require direct binaries.
+    if is_forbidden_wrapper(&name) {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::SubcommandNotAllowed,
+            message: format!(
+                "supervised program `{name}` is a shell/launcher and is not allowed; invoke git, gh, or another binary directly (no sh/env/cmd wrappers)"
+            ),
+        });
+    }
+
     match name.as_str() {
         "git" => {
             let safe = SafeGitCommand::new(&owned_args)?;
-            if safe.requires_branch_check() {
+            let repo = options.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+            let branch_check = if safe.requires_branch_check() {
                 let expected =
                     options
                         .expected_branch
-                        .as_deref()
+                        .clone()
                         .ok_or_else(|| Error::PolicyViolation {
                             code: PolicyCode::BranchMismatch,
                             message:
                                 "mutating git commands require --expected-branch under supervisor"
                                     .to_owned(),
                         })?;
-                let repo = options.repo.clone().unwrap_or_else(|| PathBuf::from("."));
-                safe.verify_branch(&repo, expected)?;
-            }
+                Some(BranchCheck {
+                    expected_branch: expected,
+                    repo: repo.clone(),
+                })
+            } else {
+                None
+            };
             Ok(PreparedCommand {
-                // Spawn the exact path the caller provided (or "git") after policy passed.
                 program: program.to_owned(),
                 args: owned_args,
+                cwd: Some(repo),
+                branch_check,
             })
         }
         "gh" => {
@@ -375,74 +447,50 @@ fn prepare_supervised_command(
             Ok(PreparedCommand {
                 program: program.to_owned(),
                 args: owned_args,
-            })
-        }
-        "sh" | "bash" | "zsh" | "dash" | "fish" | "cmd" | "powershell" | "pwsh" => {
-            reject_dangerous_shell_script(&owned_args)?;
-            Ok(PreparedCommand {
-                program: program.to_owned(),
-                args: owned_args,
-            })
-        }
-        other if other.contains("git") && other != "git" => {
-            // e.g. git-receive-pack — still require full policy via basename git only.
-            // Path-like tools that embed git in the name are allowed only if not exact git.
-            Ok(PreparedCommand {
-                program: program.to_owned(),
-                args: owned_args,
+                cwd: None,
+                branch_check: None,
             })
         }
         _ => Ok(PreparedCommand {
             program: program.to_owned(),
             args: owned_args,
+            cwd: None,
+            branch_check: None,
         }),
     }
 }
 
-fn reject_dangerous_shell_script(args: &[String]) -> Result<()> {
-    let joined = args.join(" ").to_ascii_lowercase();
-    let dangerous = [
-        ("gh pr merge", PolicyCode::MergeBlocked),
-        ("gh pr ready", PolicyCode::MergeBlocked),
-        ("git merge ", PolicyCode::MergeBlocked),
-        ("git merge\t", PolicyCode::MergeBlocked),
-        ("git push --force", PolicyCode::BareForcePush),
-        ("git push -f", PolicyCode::BareForcePush),
-    ];
-    for (needle, code) in dangerous {
-        if joined.contains(needle) {
-            // Allow force-with-lease wording to pass the bare-force heuristic.
-            if code == PolicyCode::BareForcePush && joined.contains("force-with-lease") {
-                continue;
-            }
-            return Err(Error::PolicyViolation {
-                code,
-                message: format!(
-                    "shell-wrapped forbidden operation detected in supervised command: `{needle}`"
-                ),
-            });
-        }
-    }
-    // `git merge` as sole trailing command
-    if joined.split_whitespace().any(|t| t == "merge")
-        && joined.split_whitespace().any(|t| t == "git")
-        && joined.contains("git")
-    {
-        // Avoid blocking `git mergetool` etc. — already handled by needles; skip broad match.
-    }
-    Ok(())
+fn is_forbidden_wrapper(name: &str) -> bool {
+    matches!(
+        name,
+        "sh" | "bash"
+            | "zsh"
+            | "dash"
+            | "fish"
+            | "cmd"
+            | "powershell"
+            | "pwsh"
+            | "env"
+            | "xargs"
+            | "nice"
+            | "nohup"
+            | "stdbuf"
+            | "timeout"
+            | "time"
+    )
 }
 
 async fn timeout_output(
-    pid: Option<u32>,
-    child: &mut tokio::process::Child,
+    child: &mut ProcessGroupChild,
     stdout_handle: JoinHandle<Vec<u8>>,
     stderr_handle: JoinHandle<Vec<u8>>,
 ) -> SupervisedOutput {
-    kill_process_group(pid);
     let _ = child.kill().await;
     // Bound how long we wait for the killed child and pipe readers.
     let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
+    // Abort pipe readers so they do not outlive the session as detached tasks.
+    stdout_handle.abort();
+    stderr_handle.abort();
     let stdout = join_with_timeout(stdout_handle).await;
     let stderr = join_with_timeout(stderr_handle).await;
     SupervisedOutput {
@@ -473,8 +521,8 @@ async fn drain_pipes_until(
         biased;
         _ = tokio::time::sleep_until(deadline_at) => {
             kill_process_group(pid);
-            // Dropping `drain` aborts the pipe reader tasks; timeout path prioritizes
-            // returning promptly over partial capture.
+            // Dropping `drain` cancels the await; JoinHandles are dropped with the future,
+            // which aborts the reader tasks.
             Err((Vec::new(), Vec::new()))
         }
         out = &mut drain => Ok(out),
@@ -619,13 +667,26 @@ mod tests {
     }
 
     #[test]
-    fn policy_blocks_shell_wrapped_merge() {
+    fn policy_rejects_shell_wrappers() {
         let err = check_command_policy("sh", &["-c", "gh pr merge 1"], &RunOptions::default())
             .unwrap_err();
         assert!(matches!(
             err,
             Error::PolicyViolation {
-                code: PolicyCode::MergeBlocked,
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn policy_rejects_env_launcher() {
+        let err = check_command_policy("env", &["gh", "pr", "merge"], &RunOptions::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
                 ..
             }
         ));
@@ -648,14 +709,8 @@ mod tests {
     async fn runs_command_to_completion() {
         let supervisor = Supervisor::new(4);
         let output = supervisor
-            .run(
-                shell_program(),
-                &[shell_flag(), "echo hello"],
-                None,
-                &RunOptions::default(),
-            )
-            .await
-            .unwrap();
+            .run_unchecked(shell_program(), &[shell_flag(), "echo hello"], None)
+            .await;
 
         assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
         assert!(!output.timed_out);
@@ -672,14 +727,8 @@ mod tests {
         #[cfg(not(windows))]
         let script = "echo err >&2";
         let output = supervisor
-            .run(
-                shell_program(),
-                &[shell_flag(), script],
-                None,
-                &RunOptions::default(),
-            )
-            .await
-            .unwrap();
+            .run_unchecked(shell_program(), &[shell_flag(), script], None)
+            .await;
 
         assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
         assert_eq!(output.stderr.trim(), "err");
@@ -693,14 +742,12 @@ mod tests {
         #[cfg(not(windows))]
         let script = "sleep 60";
         let output = supervisor
-            .run(
+            .run_unchecked(
                 shell_program(),
                 &[shell_flag(), script],
                 Some(Duration::from_millis(200)),
-                &RunOptions::default(),
             )
-            .await
-            .unwrap();
+            .await;
 
         assert!(output.timed_out, "stderr={}", output.stderr);
         assert!(output.killed);
@@ -714,14 +761,12 @@ mod tests {
         let supervisor = Supervisor::new(1);
         let started = Instant::now();
         let output = supervisor
-            .run(
+            .run_unchecked(
                 shell_program(),
                 &[shell_flag(), "sleep 60 &"],
                 Some(Duration::from_millis(200)),
-                &RunOptions::default(),
             )
-            .await
-            .unwrap();
+            .await;
 
         assert!(output.timed_out, "output={output:?}");
         assert!(output.killed, "output={output:?}");
@@ -739,14 +784,8 @@ mod tests {
         #[cfg(not(windows))]
         let script = "exit 42";
         let output = supervisor
-            .run(
-                shell_program(),
-                &[shell_flag(), script],
-                None,
-                &RunOptions::default(),
-            )
-            .await
-            .unwrap();
+            .run_unchecked(shell_program(), &[shell_flag(), script], None)
+            .await;
 
         assert_eq!(output.exit_code, Some(42), "stderr={}", output.stderr);
         assert!(!output.timed_out);
@@ -768,14 +807,8 @@ mod tests {
         for _ in 0..3 {
             let s = Arc::clone(&supervisor);
             handles.push(tokio::spawn(async move {
-                s.run(
-                    shell_program(),
-                    &[shell_flag(), script],
-                    None,
-                    &RunOptions::default(),
-                )
-                .await
-                .unwrap()
+                s.run_unchecked(shell_program(), &[shell_flag(), script], None)
+                    .await
             }));
         }
 
@@ -829,14 +862,12 @@ mod tests {
         #[cfg(not(windows))]
         let script = "sleep 60";
         let output = supervisor
-            .run(
+            .run_unchecked(
                 shell_program(),
                 &[shell_flag(), script],
                 Some(Duration::from_millis(200)),
-                &RunOptions::default(),
             )
-            .await
-            .unwrap();
+            .await;
 
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"timed_out\":true"), "{json}");

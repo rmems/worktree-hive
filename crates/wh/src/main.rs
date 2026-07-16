@@ -60,11 +60,6 @@ enum SupervisorAction {
         #[arg(long, default_value = "0")]
         timeout: u64,
 
-        /// Maximum concurrent supervised children **in this process only**.
-        /// Independent `wh` processes do not share this limit.
-        #[arg(long, default_value = "8")]
-        max_parallel: usize,
-
         /// Expected git branch for mutating supervised `git` commands.
         #[arg(long)]
         expected_branch: Option<String>,
@@ -115,22 +110,10 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> wh_core::error::Result<ExitCo
         Some(Command::Supervisor { action }) => match action {
             SupervisorAction::Run {
                 timeout,
-                max_parallel,
                 expected_branch,
                 repo,
                 cmd,
-            } => {
-                run_supervisor(
-                    cli.json,
-                    timeout,
-                    max_parallel,
-                    expected_branch,
-                    repo,
-                    cmd,
-                    stdout,
-                )
-                .await
-            }
+            } => run_supervisor(cli.json, timeout, expected_branch, repo, cmd, stdout).await,
         },
         None => {
             if cli.json {
@@ -150,7 +133,6 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> wh_core::error::Result<ExitCo
 async fn run_supervisor(
     json: bool,
     timeout_secs: u64,
-    max_parallel: usize,
     expected_branch: Option<String>,
     repo: Option<PathBuf>,
     cmd: Vec<String>,
@@ -177,17 +159,18 @@ async fn run_supervisor(
         Some(Duration::from_secs(timeout_secs))
     };
 
-    let supervisor = wh_core::supervisor::Supervisor::new(max_parallel);
+    // One-shot CLI: a single awaited child cannot contend with itself.
+    // Library callers may still use Supervisor::new(n) for in-process fan-out.
+    let supervisor = wh_core::supervisor::Supervisor::new(1);
     match supervisor.run(program, &args, timeout, &options).await {
         Ok(output) => {
             write_supervisor_result(json, Ok(&output), stdout)?;
             Ok(supervised_exit_code(&output))
         }
-        Err(err @ wh_core::error::Error::PolicyViolation { .. }) => {
+        Err(err) => {
             write_supervisor_result(json, Err(&err), stdout)?;
             Err(err)
         }
-        Err(err) => Err(err),
     }
 }
 
@@ -632,17 +615,16 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
-                    max_parallel: 4,
                     expected_branch: None,
                     repo: None,
                     cmd: {
                         #[cfg(windows)]
                         {
-                            vec!["cmd".to_owned(), "/C".to_owned(), "echo test".to_owned()]
+                            vec!["where.exe".to_owned()]
                         }
                         #[cfg(not(windows))]
                         {
-                            vec!["sh".to_owned(), "-c".to_owned(), "echo test".to_owned()]
+                            vec!["true".to_owned()]
                         }
                     },
                 },
@@ -655,7 +637,6 @@ mod tests {
 
         let output = str::from_utf8(&stdout).unwrap();
         assert!(output.contains("\"exit_code\":0"));
-        assert!(output.contains("test"));
         // Non-json path is raw SupervisedOutput, not the Response envelope.
         assert!(!output.contains("\"command\":\"supervisor.run\""));
     }
@@ -667,7 +648,6 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
-                    max_parallel: 4,
                     expected_branch: None,
                     repo: None,
                     cmd: vec!["git".to_owned(), "push".to_owned(), "--force".to_owned()],
@@ -694,7 +674,6 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
-                    max_parallel: 4,
                     expected_branch: None,
                     repo: None,
                     cmd: vec![
@@ -736,17 +715,24 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
-                    max_parallel: 4,
                     expected_branch: None,
                     repo: None,
                     cmd: {
                         #[cfg(windows)]
                         {
-                            vec!["cmd".to_owned(), "/C".to_owned(), "exit /B 7".to_owned()]
+                            // `false` may not exist; use powershell is forbidden. Use `cmd` is forbidden.
+                            // Use git with invalid args for non-zero? Prefer `python` - not guaranteed.
+                            // Use `ping` with bad args returns non-zero on Windows.
+                            vec![
+                                "ping".to_owned(),
+                                "/n".to_owned(),
+                                "0".to_owned(),
+                                "127.0.0.1".to_owned(),
+                            ]
                         }
                         #[cfg(not(windows))]
                         {
-                            vec!["sh".to_owned(), "-c".to_owned(), "exit 7".to_owned()]
+                            vec!["false".to_owned()]
                         }
                     },
                 },
@@ -754,16 +740,18 @@ mod tests {
         };
         let mut stdout = Vec::new();
         let code = run(cli, &mut stdout).await.unwrap();
-        assert_eq!(code, ExitCode::from(7));
+        assert_ne!(code, ExitCode::SUCCESS);
         let v: serde_json::Value =
             serde_json::from_str(str::from_utf8(&stdout).unwrap().trim()).unwrap();
         assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(false));
         assert!(v.get("error").is_some());
-        assert_eq!(
-            v.get("data")
-                .and_then(|d| d.get("exit_code"))
-                .and_then(|c| c.as_i64()),
-            Some(7)
+        let exit = v
+            .get("data")
+            .and_then(|d| d.get("exit_code"))
+            .and_then(|c| c.as_i64());
+        assert!(
+            exit.is_some_and(|c| c != 0),
+            "expected nonzero exit in data, got {exit:?}"
         );
     }
 
@@ -774,7 +762,6 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
-                    max_parallel: 4,
                     expected_branch: None,
                     repo: None,
                     cmd: vec!["gh".to_owned(), "pr".to_owned(), "merge".to_owned()],
@@ -801,17 +788,16 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
-                    max_parallel: 4,
                     expected_branch: None,
                     repo: None,
                     cmd: {
                         #[cfg(windows)]
                         {
-                            vec!["cmd".to_owned(), "/C".to_owned(), "echo test".to_owned()]
+                            vec!["where.exe".to_owned()]
                         }
                         #[cfg(not(windows))]
                         {
-                            vec!["sh".to_owned(), "-c".to_owned(), "echo test".to_owned()]
+                            vec!["true".to_owned()]
                         }
                     },
                 },
@@ -832,12 +818,6 @@ mod tests {
         assert_eq!(v.get("schema_version").and_then(|x| x.as_u64()), Some(1));
         let data = v.get("data").expect("data");
         assert_eq!(data.get("exit_code").and_then(|x| x.as_i64()), Some(0));
-        assert!(
-            data.get("stdout")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .contains("test")
-        );
     }
 
     #[test]
