@@ -148,6 +148,38 @@ impl SafeGitCommand {
             });
         }
 
+        if subcommand == "push" && args.iter().any(|a| a == "--mirror") {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::BareForcePush,
+                message: "git push --mirror is not allowed; use --force-with-lease only".to_owned(),
+            });
+        }
+
+        if subcommand == "pull" {
+            let has_safe = args
+                .iter()
+                .any(|a| a == "--rebase" || a.starts_with("--rebase=") || a == "--ff-only");
+            if !has_safe {
+                return Err(Error::PolicyViolation {
+                    code: PolicyCode::MergeBlocked,
+                    message: "git pull requires --rebase or --ff-only under hive policy".to_owned(),
+                });
+            }
+        }
+
+        if subcommand == "rebase"
+            && args
+                .iter()
+                .any(|a| a == "--exec" || a == "-x" || a.starts_with("--exec="))
+        {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                message: "git rebase --exec/-x is not allowed under hive policy".to_owned(),
+            });
+        }
+
+        reject_external_write_targets(subcommand, &args[1..])?;
+
         Ok(Self {
             args: args.to_vec(),
         })
@@ -341,31 +373,20 @@ fn first_positional_after(args: &[String]) -> Option<&str> {
             return args.get(i + 1).map(String::as_str);
         }
         if a.starts_with('-') {
-            if a.starts_with("--") && a.contains('=') {
+            // Only documented parent flags; anything else fails closed.
+            if a == "--help" || a == "-h" {
                 i += 1;
                 continue;
             }
-            if matches!(
-                a,
-                "-R" | "--repo"
-                    | "-h"
-                    | "--hostname"
-                    | "-t"
-                    | "--jq"
-                    | "-q"
-                    | "--template"
-                    | "-F"
-                    | "--field"
-                    | "-f"
-                    | "--raw-field"
-                    | "-H"
-                    | "--header"
-            ) {
+            if a == "-R" || a == "--repo" {
                 i += 2;
                 continue;
             }
-            i += 1;
-            continue;
+            if a.starts_with("--repo=") {
+                i += 1;
+                continue;
+            }
+            return None;
         }
         return Some(a);
     }
@@ -385,6 +406,103 @@ pub fn gh_requires_branch_check(args: &[String]) -> bool {
         pr_sub,
         "checkout" | "create" | "close" | "reopen" | "edit" | "ready" | "merge" | "review"
     )
+}
+
+fn reject_external_write_targets(subcommand: &str, args: &[String]) -> Result<()> {
+    match subcommand {
+        "clone" => {
+            let positionals: Vec<&str> = args
+                .iter()
+                .map(String::as_str)
+                .filter(|a| !a.starts_with('-') && *a != "--")
+                .collect();
+            if positionals.len() >= 2 {
+                let dest = positionals[1];
+                let abs = dest.starts_with('/')
+                    || (dest.len() > 2 && dest.as_bytes().get(1) == Some(&b':'));
+                if abs || dest.contains("..") {
+                    return Err(Error::PolicyViolation {
+                        code: PolicyCode::PathNotAllowed,
+                        message: format!(
+                            "git clone destination `{dest}` must be a relative path under the worktree"
+                        ),
+                    });
+                }
+            }
+        }
+        "config" => {
+            if args.iter().any(|a| a == "--global" || a == "--system") {
+                return Err(Error::PolicyViolation {
+                    code: PolicyCode::PathNotAllowed,
+                    message: "git config --global/--system is not allowed under hive policy"
+                        .to_owned(),
+                });
+            }
+            let mut i = 0;
+            while i < args.len() {
+                let a = args[i].as_str();
+                if a == "-f" || a == "--file" {
+                    if let Some(path) = args.get(i + 1) {
+                        let abs = path.starts_with('/')
+                            || (path.len() > 2 && path.as_bytes().get(1) == Some(&b':'));
+                        if abs || path.contains("..") {
+                            return Err(Error::PolicyViolation {
+                                code: PolicyCode::PathNotAllowed,
+                                message: format!(
+                                    "git config file `{path}` must stay under the worktree"
+                                ),
+                            });
+                        }
+                    }
+                }
+                if let Some(path) = a.strip_prefix("--file=") {
+                    if path.starts_with('/') || path.contains("..") {
+                        return Err(Error::PolicyViolation {
+                            code: PolicyCode::PathNotAllowed,
+                            message: format!(
+                                "git config file `{path}` must stay under the worktree"
+                            ),
+                        });
+                    }
+                }
+                i += 1;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// First positional target of `checkout`/`switch` (branch/ref name).
+#[must_use]
+pub fn checkout_or_switch_target(args: &[String]) -> Option<&str> {
+    if args.is_empty() {
+        return None;
+    }
+    let sub = args[0].as_str();
+    if sub != "checkout" && sub != "switch" {
+        return None;
+    }
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            return args.get(i + 1).map(String::as_str);
+        }
+        if a.starts_with('-') {
+            if matches!(a, "-b" | "-B" | "-c" | "-C" | "--orphan" | "--track" | "-t") {
+                return args.get(i + 1).map(String::as_str);
+            }
+            if a.starts_with("--") && a.contains('=') {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        return Some(a);
+    }
+    None
 }
 
 fn is_merge_subcommand(subcommand: &str) -> bool {
@@ -540,6 +658,100 @@ mod tests {
             err,
             Error::PolicyViolation {
                 code: PolicyCode::BareForcePush,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn push_mirror_rejected() {
+        let err = SafeGitCommand::new(&[
+            "push".to_owned(),
+            "--mirror".to_owned(),
+            "origin".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::BareForcePush,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pull_without_rebase_or_ff_only_rejected() {
+        let err = SafeGitCommand::new(&["pull".to_owned(), "origin".to_owned(), "main".to_owned()])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::MergeBlocked,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pull_with_rebase_allowed() {
+        SafeGitCommand::new(&[
+            "pull".to_owned(),
+            "--rebase".to_owned(),
+            "origin".to_owned(),
+            "main".to_owned(),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn rebase_exec_rejected() {
+        let err = SafeGitCommand::new(&[
+            "rebase".to_owned(),
+            "-x".to_owned(),
+            "true".to_owned(),
+            "main".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn clone_absolute_dest_rejected() {
+        let err = SafeGitCommand::new(&[
+            "clone".to_owned(),
+            "https://example.com/r.git".to_owned(),
+            "/tmp/outside".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn config_global_rejected() {
+        let err = SafeGitCommand::new(&[
+            "config".to_owned(),
+            "--global".to_owned(),
+            "user.name".to_owned(),
+            "x".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
                 ..
             }
         ));
@@ -742,32 +954,52 @@ mod tests {
     ///
     /// Avoids depending on the workspace checkout (tarpaulin / detached HEAD).
     fn temp_repo_with_branch(branch: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "wh-core-git-safe-{}-{}",
+            "wh-core-git-safe-{}-{}-{}",
             std::process::id(),
+            seq,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         std::fs::create_dir_all(&dir).expect("create temp repo dir");
 
+        let null_dev = if cfg!(windows) { "NUL" } else { "/dev/null" };
         let git = |args: &[&str]| {
-            let status = Command::new("git")
+            let output = Command::new("git")
                 .arg("-C")
                 .arg(&dir)
                 .args(args)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .status()
+                .env("GIT_CONFIG_GLOBAL", null_dev)
+                .output()
                 .expect("spawn git");
-            assert!(status.success(), "git {args:?} failed in {}", dir.display());
+            assert!(
+                output.status.success(),
+                "git {args:?} failed in {}: {}",
+                dir.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
         };
 
-        git(&["init", "-b", branch]);
+        // Portable across Git versions / Windows template races.
+        git(&["init"]);
+        git(&["checkout", "-b", branch]);
         git(&["config", "user.email", "test@example.com"]);
         git(&["config", "user.name", "wh-core-test"]);
-        std::fs::write(dir.join("README"), "init\n").expect("write README");
+        std::fs::write(
+            dir.join("README"),
+            "init
+",
+        )
+        .expect("write README");
         git(&["add", "README"]);
         git(&["commit", "-m", "init"]);
         dir

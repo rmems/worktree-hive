@@ -844,6 +844,8 @@ mod tests {
             killed: true,
             stdout: String::new(),
             stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
             error_code: None,
         };
         assert_eq!(supervised_exit_code(&timed_out), ExitCode::from(124));
@@ -854,6 +856,8 @@ mod tests {
             killed: false,
             stdout: String::new(),
             stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
             error_code: None,
         };
         assert_eq!(supervised_exit_code(&child_fail), ExitCode::from(7));

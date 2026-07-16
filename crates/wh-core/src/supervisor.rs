@@ -66,6 +66,12 @@ pub struct SupervisedOutput {
     pub stdout: String,
     /// Captured stderr.
     pub stderr: String,
+    /// True when stdout hit the capture cap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stdout_truncated: bool,
+    /// True when stderr hit the capture cap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stderr_truncated: bool,
     /// Structured failure code when the run is not a clean success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<SupervisorErrorCode>,
@@ -202,6 +208,8 @@ impl Supervisor {
                         killed: false,
                         stdout: String::new(),
                         stderr: "timed out waiting for max-parallel permit".to_owned(),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         error_code: Some(SupervisorErrorCode::TimedOut),
                     });
                 }
@@ -229,6 +237,8 @@ impl Supervisor {
                 killed: false,
                 stdout: String::new(),
                 stderr: "timed out waiting for max-parallel permit".to_owned(),
+                stdout_truncated: false,
+                stderr_truncated: false,
                 error_code: Some(SupervisorErrorCode::TimedOut),
             });
         }
@@ -300,6 +310,8 @@ impl Supervisor {
                     killed: false,
                     stdout: String::new(),
                     stderr: format!("failed to spawn: {e}"),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     error_code: Some(SupervisorErrorCode::SpawnFailed),
                 };
             }
@@ -339,6 +351,8 @@ impl Supervisor {
                                     killed: true,
                                     stdout: String::from_utf8_lossy(&stdout).into_owned(),
                                     stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                                    stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
+                                    stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
                                     error_code: Some(SupervisorErrorCode::TimedOut),
                                 },
                             }
@@ -349,6 +363,8 @@ impl Supervisor {
                             killed: false,
                             stdout: String::new(),
                             stderr: format!("process error: {e}"),
+                            stdout_truncated: false,
+                            stderr_truncated: false,
                             error_code: Some(SupervisorErrorCode::WaitFailed),
                         },
                     }
@@ -367,6 +383,8 @@ impl Supervisor {
                     killed: false,
                     stdout: String::new(),
                     stderr: format!("process error: {e}"),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     error_code: Some(SupervisorErrorCode::WaitFailed),
                 },
             }
@@ -470,6 +488,19 @@ fn prepare_supervised_command(
             } else {
                 None
             };
+            if let (Some(exp), Some(target)) = (
+                expected.as_deref(),
+                crate::git_safe::checkout_or_switch_target(&owned_args),
+            ) {
+                if target != exp && target != "HEAD" {
+                    return Err(Error::PolicyViolation {
+                        code: PolicyCode::BranchMismatch,
+                        message: format!(
+                            "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
+                        ),
+                    });
+                }
+            }
             // Always spawn PATH `git`, never a user-supplied path-qualified binary.
             let repo = resolve_supervised_repo(options.repo.as_deref())?;
             let branch_check = expected.map(|expected_branch| BranchCheck {
@@ -525,7 +556,7 @@ fn prepare_supervised_command(
 }
 
 fn is_forbidden_wrapper(name: &str) -> bool {
-    matches!(
+    if matches!(
         name,
         "sh" | "bash"
             | "zsh"
@@ -558,21 +589,38 @@ fn is_forbidden_wrapper(name: &str) -> bool {
             | "perl"
             | "ruby"
             | "node"
+            | "nodejs"
             | "deno"
             | "bun"
             | "php"
             | "lua"
             | "rscript"
+            | "ipython"
+            | "ipython3"
             | "curl"
             | "wget"
             | "http"
             | "httpie"
-            | "nodejs"
             | "nc"
             | "ncat"
             | "netcat"
             | "socat"
-    )
+    ) {
+        return true;
+    }
+    for p in [
+        "python", "python2", "python3", "perl", "ruby", "node", "nodejs", "php", "lua", "ipython",
+    ] {
+        if let Some(rest) = name.strip_prefix(p) {
+            if rest.is_empty() {
+                return true;
+            }
+            if rest.starts_with('.') || rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Resolve and validate `--repo` for supervised git (cwd + branch checks).
@@ -675,6 +723,8 @@ async fn timeout_output(
         killed: true,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout_truncated: false,
+        stderr_truncated: false,
         error_code: Some(SupervisorErrorCode::TimedOut),
     }
 }
@@ -770,6 +820,8 @@ fn output_to_supervised(
         killed,
         stdout: String::from_utf8_lossy(stdout).into_owned(),
         stderr: String::from_utf8_lossy(stderr).into_owned(),
+        stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
+        stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
         error_code: None,
     };
     if killed {
@@ -901,6 +953,19 @@ mod tests {
     }
 
     #[test]
+    fn policy_rejects_versioned_python() {
+        let err = check_command_policy("python3.11", &["-c", "print(1)"], &RunOptions::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn policy_rejects_interpreter_launchers() {
         let err = check_command_policy(
             "python3",
@@ -953,7 +1018,13 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(matches!(err, Error::PolicyViolation { .. }));
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1107,6 +1178,8 @@ mod tests {
             killed: false,
             stdout: "hello\n".to_string(),
             stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
             error_code: None,
         };
 
