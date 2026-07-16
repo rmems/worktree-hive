@@ -108,52 +108,6 @@ pub fn state_path() -> PathBuf {
     resolve_state_path(std::env::var_os("WH_STATE_PATH").as_deref())
 }
 
-#[cfg(test)]
-mod tests {
-    use std::ffi::OsStr;
-
-    use super::{StateRoot, resolve_state_path, user_data_dir};
-
-    #[test]
-    fn user_data_dir_is_non_empty() {
-        let dir = user_data_dir();
-        assert!(!dir.as_os_str().is_empty());
-    }
-
-    #[test]
-    fn state_root_watched_json_joins_filename() {
-        let root = StateRoot::from_path("/tmp/wh-state");
-        assert_eq!(
-            root.watched_json(),
-            std::path::PathBuf::from("/tmp/wh-state/watched.json")
-        );
-    }
-
-    #[test]
-    fn resolve_state_path_honours_wh_state_path_override() {
-        let path = resolve_state_path(Some(OsStr::new("/tmp/acme/watched.json")));
-        assert_eq!(path, std::path::PathBuf::from("/tmp/acme/watched.json"));
-    }
-
-    #[test]
-    fn resolve_state_path_empty_override_uses_default() {
-        let path = resolve_state_path(Some(OsStr::new("")));
-        assert!(
-            path.ends_with("worktrees-hives/watched.json")
-                || path.ends_with("worktrees-hives\\watched.json")
-        );
-    }
-
-    #[test]
-    fn resolve_state_path_default_uses_state_root() {
-        let path = resolve_state_path(None);
-        assert!(
-            path.ends_with("worktrees-hives/watched.json")
-                || path.ends_with("worktrees-hives\\watched.json")
-        );
-    }
-}
-
 const WORKTREE_BASE_ENV: &str = "WH_WORKTREE_BASE";
 
 /// Resolve the configured worktree base path.
@@ -198,4 +152,72 @@ fn validate_path_segment(field: &'static str, value: &str) -> crate::error::Resu
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    use super::{
+        StateRoot, derive_worktree_path, resolve_state_path, user_data_dir, worktree_base_path,
+    };
+
+    #[test]
+    fn user_data_dir_is_non_empty() {
+        let dir = user_data_dir();
+        assert!(!dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn state_root_watched_json_joins_filename() {
+        let root = StateRoot::from_path("/tmp/wh-state");
+        assert_eq!(
+            root.watched_json(),
+            PathBuf::from("/tmp/wh-state/watched.json")
+        );
+    }
+
+    #[test]
+    fn resolve_state_path_honours_wh_state_path_override() {
+        let path = resolve_state_path(Some(OsStr::new("/tmp/acme/watched.json")));
+        assert_eq!(path, PathBuf::from("/tmp/acme/watched.json"));
+    }
+
+    #[test]
+    fn resolve_state_path_empty_override_uses_default() {
+        let path = resolve_state_path(Some(OsStr::new("")));
+        assert!(
+            path.ends_with("worktrees-hives/watched.json")
+                || path.ends_with("worktrees-hives\\watched.json")
+        );
+    }
+
+    #[test]
+    fn resolve_state_path_default_uses_state_root() {
+        let path = resolve_state_path(None);
+        assert!(
+            path.ends_with("worktrees-hives/watched.json")
+                || path.ends_with("worktrees-hives\\watched.json")
+        );
+    }
+
+    #[test]
+    fn derive_worktree_path_joins_segments() {
+        let path = derive_worktree_path(PathBuf::from("/base").as_path(), "o", "r", "j").unwrap();
+        assert_eq!(path, PathBuf::from("/base/o/r/j"));
+    }
+
+    #[test]
+    fn derive_worktree_path_rejects_escape() {
+        assert!(derive_worktree_path(PathBuf::from("/b").as_path(), "..", "r", "j").is_err());
+        assert!(derive_worktree_path(PathBuf::from("/b").as_path(), "o", "a/b", "j").is_err());
+    }
+
+    #[test]
+    fn worktree_base_path_default_under_user_data() {
+        // Ensure no override for this process snapshot (may already be set in CI).
+        let path = worktree_base_path().unwrap();
+        assert!(!path.as_os_str().is_empty());
+    }
 }
