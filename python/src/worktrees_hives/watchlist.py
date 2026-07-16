@@ -20,7 +20,7 @@ WH_ALLOWED_OWNERS_ENV = "WH_ALLOWED_OWNERS"
 MAX_FIXES_CEILING = 3
 
 # Empty default — no org hardcoding. Configure via WH_ALLOWED_OWNERS or
-# Watchlist(allowed_owners=...). Empty allowlist = allow any owner.
+# Watchlist(allowed_owners=...). Empty allowlist = deny-by-default (no owner matches).
 ALLOWED_OWNERS: frozenset[str] = frozenset()
 
 
@@ -171,7 +171,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _validate_max_fixes(max_fixes: int) -> int:
-    """Validate max_fixes is in [0, MAX_FIXES_CEILING]."""
+    """Validate max_fixes is in [0, MAX_FIXES_CEILING] for write paths (add)."""
     if max_fixes < 0:
         raise ValueError("max_fixes must be non-negative")
     if max_fixes > MAX_FIXES_CEILING:
@@ -182,9 +182,20 @@ def _validate_max_fixes(max_fixes: int) -> int:
     return max_fixes
 
 
+def _clamp_max_fixes(max_fixes: int) -> int:
+    """Clamp loaded max_fixes into [0, MAX_FIXES_CEILING] without dropping the job."""
+    if max_fixes < 0:
+        return 0
+    return min(max_fixes, MAX_FIXES_CEILING)
+
+
 def _owner_allowed(owner: str, allowed_owners: frozenset[str]) -> bool:
-    """Return whether owner is within the configured repository scope."""
-    return not allowed_owners or owner in allowed_owners
+    """Return whether owner is within the configured repository scope.
+
+    Empty allowlist denies all owners (deny-by-default). Operators must set
+    WH_ALLOWED_OWNERS or pass allowed_owners= explicitly.
+    """
+    return bool(allowed_owners) and owner in allowed_owners
 
 
 class Watchlist:
@@ -203,6 +214,9 @@ class Watchlist:
         self._jobs: dict[str, JobState] = {}
         # Additive v1 fields (kind, worktree_path, timestamps, …) preserved per job.
         self._job_extras: dict[str, dict[str, Any]] = {}
+        # Raw job records not active in this process (disallowed owner / unparseable).
+        # Re-written on save so a partial load never permanently drops durable entries.
+        self._deferred_raw: dict[str, dict[str, Any]] = {}
         if allowed_owners is None:
             self._allowed_owners = load_allowed_owners_from_env()
         else:
@@ -215,11 +229,14 @@ class Watchlist:
         return self._path
 
     def _load(self) -> None:
-        """Load state from disk; re-validate max_fixes on load.
+        """Load state from disk; clamp max_fixes; filter by owner allowlist.
 
         Unknown keys on job objects are treated as additive v1 fields: filtered
         out of JobState construction and preserved for round-trip on save so a
         compatible writer (e.g. Rust) does not lose watched jobs.
+
+        Jobs outside the owner allowlist or that fail to parse are kept in
+        ``_deferred_raw`` so the next save does not permanently erase them.
         """
         data = _read_json(self._path)
         jobs_data = data.get("jobs", {})
@@ -227,37 +244,43 @@ class Watchlist:
             jobs_data = {}
         self._jobs = {}
         self._job_extras = {}
+        self._deferred_raw = {}
         for job_id, job_dict in jobs_data.items():
+            jid = str(job_id)
+            if not isinstance(job_dict, dict):
+                continue
+            raw = dict(job_dict)
             try:
-                if not isinstance(job_dict, dict):
-                    continue
-                raw = dict(job_dict)
                 extras = {k: v for k, v in raw.items() if k not in _JOB_STATE_FIELDS}
                 d = {k: v for k, v in raw.items() if k in _JOB_STATE_FIELDS}
                 d["status"] = JobStatus(d["status"])
-                max_fixes = int(d.get("max_fixes", 3))
-                _validate_max_fixes(max_fixes)
+                max_fixes = _clamp_max_fixes(int(d.get("max_fixes", 3)))
                 d["max_fixes"] = max_fixes
                 fix_count = int(d.get("fix_count", 0))
                 if fix_count < 0:
-                    continue
+                    fix_count = 0
                 d["fix_count"] = fix_count
                 owner = str(d["owner"])
                 if not _owner_allowed(owner, self._allowed_owners):
+                    # Not scheduled, but keep durable record for later allowlist changes.
+                    self._deferred_raw[jid] = raw
                     continue
                 d["owner"] = owner
-                jid = str(job_id)
+                # Dict key is authoritative for job_id (avoid silent drift).
+                d["job_id"] = jid
                 self._jobs[jid] = JobState(**d)
                 if extras:
                     self._job_extras[jid] = extras
             except (KeyError, ValueError, TypeError, PolicyError):
-                continue  # skip corrupt/incompatible entry
+                # Preserve unparseable records so they are not wiped on next save.
+                self._deferred_raw[jid] = raw
 
     def _save(self) -> None:
         """Save state to disk atomically."""
         jobs: dict[str, dict[str, Any]] = {}
         for jid, job in self._jobs.items():
             job_dict: dict[str, Any] = asdict(job)
+            job_dict["job_id"] = jid
             # Enum values → strings for JSON
             status = job_dict.get("status")
             if isinstance(status, JobStatus):
@@ -267,6 +290,10 @@ class Watchlist:
                 if key not in job_dict:
                     job_dict[key] = value
             jobs[jid] = job_dict
+        # Re-emit deferred records (disallowed / unparseable) so they are not lost.
+        for jid, raw in self._deferred_raw.items():
+            if jid not in jobs:
+                jobs[jid] = raw
         data: dict[str, Any] = {
             "schema_version": 1,
             "jobs": jobs,
@@ -290,13 +317,17 @@ class Watchlist:
         """
         max_fixes = _validate_max_fixes(max_fixes)
         if not _owner_allowed(owner, self._allowed_owners):
-            raise PolicyError(
-                f"Owner {owner!r} not in allowed owners: "
-                f"{sorted(self._allowed_owners)}. "
-                f"Set {WH_ALLOWED_OWNERS_ENV} or pass allowed_owners=."
+            allow = sorted(self._allowed_owners)
+            hint = (
+                f"allowed owners: {allow}"
+                if allow
+                else f"set {WH_ALLOWED_OWNERS_ENV} or pass allowed_owners="
             )
+            raise PolicyError(f"Owner {owner!r} not in allowlist ({hint})")
         if job_id in self._jobs:
             raise ValueError(f"Job {job_id!r} already exists in watchlist")
+        # Promoting a previously deferred id into active set.
+        self._deferred_raw.pop(job_id, None)
         job = JobState(
             job_id=job_id,
             owner=owner,
@@ -314,10 +345,11 @@ class Watchlist:
 
         Raises KeyError if job_id not found.
         """
-        if job_id not in self._jobs:
+        if job_id not in self._jobs and job_id not in self._deferred_raw:
             raise KeyError(f"Job {job_id!r} not found in watchlist")
-        del self._jobs[job_id]
+        self._jobs.pop(job_id, None)
         self._job_extras.pop(job_id, None)
+        self._deferred_raw.pop(job_id, None)
         self._save()
 
     def get(self, job_id: str) -> JobState | None:
@@ -399,8 +431,27 @@ class Watchlist:
         self._save()
         return job
 
-    def check(self) -> dict[str, list[JobState]]:
-        """Check all jobs and categorize by action needed.
+    def record_check(self, job_id: str, error: str | None = None) -> JobState:
+        """Record a check timestamp (and optional error) for a job and persist.
+
+        Raises KeyError if job_id not found.
+        """
+        job = self._jobs.get(job_id)
+        if job is None:
+            raise KeyError(f"Job {job_id!r} not found in watchlist")
+        job.last_check = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        job.error = error
+        self._save()
+        return job
+
+    def check(
+        self,
+        owner: str | None = None,
+        repo: str | None = None,
+        *,
+        record: bool = True,
+    ) -> dict[str, list[JobState]]:
+        """Check jobs and categorize by action needed.
 
         Categories:
           - needs_pr: actionable job with no PR yet
@@ -408,6 +459,10 @@ class Watchlist:
           - blocked: residual blockers with exhausted budget, or explicit BLOCKED status
           - ready: has PR, no residual blockers (awaiting merge / healthy)
           - done: COMPLETED or FAILED
+
+        Optional ``owner`` / ``repo`` filters mirror ``list_jobs``.
+        When ``record`` is True (default), updates each matched job's
+        ``last_check`` timestamp and persists once.
 
         Note: a green PR with remaining budget is **ready**, not needs_fix.
         Exhausted budget with blockers is **blocked**, not ready.
@@ -419,7 +474,12 @@ class Watchlist:
             "ready": [],
             "done": [],
         }
-        for job in self._jobs.values():
+        jobs = self.list_jobs(owner=owner, repo=repo)
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        for job in jobs:
+            if record:
+                job.last_check = now
+                job.error = None
             if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
                 result["done"].append(job)
             elif job.residual_blockers:
@@ -434,4 +494,6 @@ class Watchlist:
             else:
                 # Has PR, no residual blockers — ready regardless of remaining budget
                 result["ready"].append(job)
+        if record and jobs:
+            self._save()
         return result

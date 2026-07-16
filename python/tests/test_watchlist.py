@@ -20,6 +20,10 @@ from worktrees_hives.watchlist import (
 )
 
 
+# Explicit test allowlist (module deny-by-default when empty).
+_TEST_OWNERS = frozenset({"acme", "example-org", "other-owner"})
+
+
 @pytest.fixture
 def state_path(tmp_path: Path) -> Path:
     """Return a temporary state file path (watched.json)."""
@@ -28,8 +32,8 @@ def state_path(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def watchlist(state_path: Path) -> Watchlist:
-    """Return a fresh Watchlist instance."""
-    return Watchlist(state_path)
+    """Return a fresh Watchlist instance with a test owner allowlist."""
+    return Watchlist(state_path, allowed_owners=_TEST_OWNERS)
 
 
 class TestAtomicWrite:
@@ -102,9 +106,9 @@ class TestWatchlistAdd:
             watchlist.add("j1", "acme", "repo", "br")
 
     def test_add_persists(self, state_path: Path) -> None:
-        w1 = Watchlist(state_path)
+        w1 = Watchlist(state_path, allowed_owners=_TEST_OWNERS)
         w1.add("j1", "acme", "repo", "br")
-        w2 = Watchlist(state_path)
+        w2 = Watchlist(state_path, allowed_owners=_TEST_OWNERS)
         job = w2.get("j1")
         assert job is not None
         assert job.owner == "acme"
@@ -121,14 +125,14 @@ class TestWatchlistAdd:
 
 
 class TestMaxFixesOnLoad:
-    def test_invalid_max_fixes_skipped(self, state_path: Path) -> None:
+    def test_over_ceiling_max_fixes_clamped(self, state_path: Path) -> None:
         state_path.write_text(
             json.dumps(
                 {
                     "schema_version": 1,
                     "jobs": {
-                        "bad": {
-                            "job_id": "bad",
+                        "high": {
+                            "job_id": "high",
                             "owner": "acme",
                             "repo": "r",
                             "branch": "br",
@@ -152,8 +156,10 @@ class TestMaxFixesOnLoad:
             ),
             encoding="utf-8",
         )
-        w = Watchlist(state_path)
-        assert w.get("bad") is None
+        w = Watchlist(state_path, allowed_owners=frozenset({"acme"}))
+        high = w.get("high")
+        assert high is not None
+        assert high.max_fixes == 3  # clamped to ceiling, not dropped
         good = w.get("good")
         assert good is not None
         assert good.max_fixes == 2
@@ -249,7 +255,7 @@ class TestWatchlistFixCount:
     ) -> None:
         """Even if max_fixes were higher in memory, ceiling still caps increments."""
         monkeypatch.delenv("WH_ALLOWED_OWNERS", raising=False)
-        w = Watchlist(state_path)
+        w = Watchlist(state_path, allowed_owners=_TEST_OWNERS)
         w.add("j1", "acme", "repo", "br", max_fixes=3)
         job = w.get("j1")
         assert job is not None
@@ -257,7 +263,7 @@ class TestWatchlistFixCount:
         job.max_fixes = 10
         for _ in range(3):
             w.increment_fix_count("j1")
-        with pytest.raises(PolicyError, match="exhausted|ceiling"):
+        with pytest.raises(PolicyError, match=r"exhausted|ceiling"):
             w.increment_fix_count("j1")
 
 
@@ -267,20 +273,20 @@ class TestOwnerAllowlist:
     def test_default_allowed_owners_empty(self) -> None:
         assert frozenset() == ALLOWED_OWNERS
 
-    def test_empty_allowlist_allows_any(
+    def test_empty_allowlist_denies_by_default(
         self, state_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("WH_ALLOWED_OWNERS", raising=False)
         w = Watchlist(state_path)
-        job = w.add("j1", "other-owner", "repo", "br")
-        assert job.owner == "other-owner"
+        with pytest.raises(PolicyError, match="not in allowlist"):
+            w.add("j1", "other-owner", "repo", "br")
 
     def test_env_allowlist_rejects_other_owner(
         self, state_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme")
         w = Watchlist(state_path)
-        with pytest.raises(PolicyError, match="not in allowed owners"):
+        with pytest.raises(PolicyError, match="not in allowlist"):
             w.add("j1", "other-owner", "repo", "br")
         w.add("j2", "acme", "repo", "br")
         assert w.get("j2") is not None
@@ -288,7 +294,7 @@ class TestOwnerAllowlist:
     def test_constructor_allowlist(self, state_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("WH_ALLOWED_OWNERS", raising=False)
         w = Watchlist(state_path, allowed_owners=frozenset({"acme"}))
-        with pytest.raises(PolicyError, match="not in allowed owners"):
+        with pytest.raises(PolicyError, match="not in allowlist"):
             w.add("j1", "evil", "repo", "br")
 
     def test_env_allowlist_filters_loaded_jobs(
@@ -331,8 +337,13 @@ class TestOwnerAllowlist:
         assert w.get("good") is not None
         assert w.get("bad") is None
         assert [job.job_id for job in w.list_jobs()] == ["good"]
-        result = w.check()
+        result = w.check(record=False)
         assert [job.job_id for job in result["needs_pr"]] == ["good"]
+        # Disallowed owner still on disk after a save of allowed jobs
+        w.update_status("good", JobStatus.IN_PROGRESS)
+        reloaded = json.loads(state_path.read_text(encoding="utf-8"))
+        assert "bad" in reloaded["jobs"]
+        assert reloaded["jobs"]["bad"]["owner"] == "evil"
 
     def test_constructor_allowlist_filters_loaded_jobs(
         self, state_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -396,7 +407,7 @@ class TestAdditiveV1Fields:
             ),
             encoding="utf-8",
         )
-        w = Watchlist(state_path)
+        w = Watchlist(state_path, allowed_owners=frozenset({"acme"}))
         job = w.get("j1")
         assert job is not None
         assert job.owner == "acme"
@@ -525,9 +536,12 @@ class TestMultiOwner:
 class TestCliPolicyExit:
     """CLI maps PolicyError to exit code 2."""
 
-    def test_add_max_fixes_policy_returns_2(self, tmp_path: Path) -> None:
+    def test_add_max_fixes_policy_returns_2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from worktrees_hives.cli import main
 
+        monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme")
         code = main(
             [
                 "--state",
@@ -544,15 +558,43 @@ class TestCliPolicyExit:
         )
         assert code == 2
 
-    def test_add_duplicate_returns_1(self, tmp_path: Path) -> None:
+    def test_add_duplicate_returns_1(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from worktrees_hives.cli import main
 
+        monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme")
         state = str(tmp_path / "watched.json")
         assert main(["--state", state, "watchlist", "add", "j1", "acme", "repo", "br"]) == 0
         assert main(["--state", state, "watchlist", "add", "j1", "acme", "repo", "br"]) == 1
 
-    def test_prog_is_worktrees_hives(self) -> None:
+    def test_remove_missing_returns_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from worktrees_hives.cli import main
 
-        with pytest.raises(SystemExit):
+        monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme")
+        state = str(tmp_path / "watched.json")
+        assert main(["--state", state, "watchlist", "remove", "missing"]) == 1
+
+    def test_list_and_check_via_main(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from worktrees_hives.cli import main
+
+        monkeypatch.setenv("WH_ALLOWED_OWNERS", "acme")
+        state = str(tmp_path / "watched.json")
+        assert main(["--state", state, "watchlist", "add", "j1", "acme", "repo", "br"]) == 0
+        assert main(["--state", state, "watchlist", "list", "--owner", "acme"]) == 0
+        out = capsys.readouterr().out
+        assert "j1" in out
+        assert main(["--state", state, "watchlist", "check", "--owner", "acme"]) == 0
+        out2 = capsys.readouterr().out
+        assert "NEEDS_PR" in out2 or "j1" in out2
+
+    def test_prog_is_worktrees_hives(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from worktrees_hives.cli import main
+
+        with pytest.raises(SystemExit) as exc:
             main(["--help"])
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "worktrees-hives" in out

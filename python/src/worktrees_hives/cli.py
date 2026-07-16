@@ -97,7 +97,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     except CorruptStateError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
-    categories = w.check()
+    categories = w.check(owner=args.owner, repo=args.repo)
     has_work = False
     for category, jobs in categories.items():
         if jobs:
@@ -155,7 +155,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # watchlist check
-    wl_sub.add_parser("check", help="Check jobs and show action needed")
+    check_p = wl_sub.add_parser("check", help="Check jobs and show action needed")
+    check_p.add_argument("--owner", help="Filter by owner")
+    check_p.add_argument("--repo", help="Filter by repo")
 
     args = parser.parse_args(argv)
 
