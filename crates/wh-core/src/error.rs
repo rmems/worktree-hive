@@ -51,6 +51,8 @@ pub enum PolicyCode {
     GhSubcommandNotAllowed,
     /// A gh subcommand flag is not permitted.
     GhFlagNotAllowed,
+    /// A path is outside the allowed sandbox (e.g. supervised --repo).
+    PathNotAllowed,
 }
 
 impl PolicyCode {
@@ -65,6 +67,7 @@ impl PolicyCode {
             Self::GitDirUnavailable => "GIT_DIR_UNAVAILABLE",
             Self::GhSubcommandNotAllowed => "GH_SUBCOMMAND_NOT_ALLOWED",
             Self::GhFlagNotAllowed => "GH_FLAG_NOT_ALLOWED",
+            Self::PathNotAllowed => "PATH_NOT_ALLOWED",
         }
     }
 }
