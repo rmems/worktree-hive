@@ -26,15 +26,20 @@ impl WorktreeManager {
     /// Create a new manager using the default base path.
     pub fn new() -> Result<Self> {
         let base = worktree_base_path()?;
-        Ok(Self {
-            base_path: Some(base),
-        })
+        Self::with_base(base)
     }
 
     /// Create a new manager with an explicit base path (for testing or overrides).
+    ///
+    /// The base is created if missing and stored in canonical form so OS path
+    /// aliases (e.g. macOS `/var` → `/private/var`) do not trip sandbox checks.
     pub fn with_base(base: PathBuf) -> Result<Self> {
         fs::create_dir_all(&base).map_err(|e| Error::Io {
             context: "create worktree base directory",
+            source: e,
+        })?;
+        let base = fs::canonicalize(&base).map_err(|e| Error::Io {
+            context: "canonicalize worktree base directory",
             source: e,
         })?;
         Ok(Self {
@@ -71,17 +76,18 @@ impl WorktreeManager {
         }
 
         let base = self.base_path()?;
-        // Reject symlinked components under the sandbox base so add cannot escape.
-        reject_symlink_components(base)?;
         let worktree_path = derive_worktree_path(base, owner, repo, job_id)?;
 
-        // Ensure parent directories exist (after symlink check on base).
+        // Reject symlink *segments under the base* (not OS aliases above the base
+        // such as macOS /var → /private/var). Pre-check existing segments, mkdir,
+        // then re-check so we never follow a planted escape link.
+        reject_symlink_components_under(base, &worktree_path)?;
         if let Some(parent) = worktree_path.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::Io {
                 context: "create worktree parent directories",
                 source: e,
             })?;
-            reject_symlink_components(parent)?;
+            reject_symlink_components_under(base, parent)?;
         }
 
         // Verify the repo_root is a valid git repository
@@ -403,23 +409,37 @@ fn find_repo_root_for_worktree(worktree_path: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Reject any symlink component under `path` so worktree add cannot escape the sandbox.
-fn reject_symlink_components(path: &Path) -> Result<()> {
-    let mut cur = PathBuf::new();
-    for comp in path.components() {
+/// Reject symlink components of `path` that lie *under* `base`.
+///
+/// Components of `base` itself (and ancestors) are not checked: on macOS the
+/// system temp root lives under `/var` → `/private/var`, which is a legitimate
+/// OS alias, not an escape. Escape risk is owner/repo/job segments that are
+/// symlinks pointing outside the sandbox.
+fn reject_symlink_components_under(base: &Path, path: &Path) -> Result<()> {
+    let relative = path
+        .strip_prefix(base)
+        .map_err(|_| Error::SandboxViolation {
+            base: base.to_path_buf(),
+            candidate: path.to_path_buf(),
+            reason: "path is not under worktree base",
+        })?;
+
+    let mut cur = base.to_path_buf();
+    for comp in relative.components() {
         cur.push(comp);
-        if cur.exists() {
-            let meta = fs::symlink_metadata(&cur).map_err(|e| Error::Io {
-                context: "stat path component for symlink check",
-                source: e,
-            })?;
-            if meta.file_type().is_symlink() {
-                return Err(Error::SandboxViolation {
-                    base: path.to_path_buf(),
-                    candidate: cur,
-                    reason: "symlink component under worktree base is not allowed",
-                });
-            }
+        if !cur.exists() {
+            continue;
+        }
+        let meta = fs::symlink_metadata(&cur).map_err(|e| Error::Io {
+            context: "stat path component for symlink check",
+            source: e,
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(Error::SandboxViolation {
+                base: base.to_path_buf(),
+                candidate: cur,
+                reason: "symlink component under worktree base is not allowed",
+            });
         }
     }
     Ok(())
@@ -638,5 +658,35 @@ mod tests {
 
         // Prune should clean up the git worktree admin files
         manager.prune(&repo_root).unwrap();
+    }
+
+    #[test]
+    fn reject_symlink_owner_under_base() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let repo_root = init_test_repo(&repo).unwrap();
+
+        let base = temp.path().join("worktrees");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let manager = WorktreeManager::with_base(base.clone()).unwrap();
+
+        // Pre-create owner segment as a symlink that escapes the base.
+        let owner_link = manager.base_path().unwrap().join("acme");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, &owner_link).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(&outside, &owner_link).unwrap();
+        }
+
+        let result = manager.create(&repo_root, "acme", "test-repo", "job-sym", "branch-sym");
+        assert!(
+            matches!(result, Err(Error::SandboxViolation { .. })),
+            "expected SandboxViolation, got {result:?}"
+        );
     }
 }
