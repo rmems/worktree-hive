@@ -190,6 +190,13 @@ impl SafeGitCommand {
                     message: "git push --prune is not allowed under hive policy".to_owned(),
                 });
             }
+            // Broad multi-ref pushes can update branches other than the job branch.
+            if args.iter().any(|a| a == "--all") {
+                return Err(Error::PolicyViolation {
+                    code: PolicyCode::BranchMismatch,
+                    message: "git push --all is not allowed under hive policy".to_owned(),
+                });
+            }
         }
 
         if subcommand == "pull" && !pull_uses_safe_history_strategy(args) {
@@ -211,12 +218,22 @@ impl SafeGitCommand {
         if matches!(
             subcommand.as_str(),
             "push" | "pull" | "fetch" | "clone" | "ls-remote"
-        ) && args.iter().any(|a| is_remote_helper_exec_option(a))
+        ) && args
+            .iter()
+            .any(|a| is_remote_helper_exec_option(a, subcommand))
         {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::SubcommandNotAllowed,
                 message: "git remote helper exec options (--receive-pack/--upload-pack/--exec) are not allowed"
                     .to_owned(),
+            });
+        }
+
+        // `ext::<command>` remote helper runs arbitrary local commands.
+        if args.iter().any(|a| is_ext_transport_url(a)) {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                message: "git ext:: transport URLs are not allowed under hive policy".to_owned(),
             });
         }
 
@@ -788,11 +805,27 @@ fn is_rebase_exec_option(arg: &str) -> bool {
         || (arg.starts_with("-x") && arg.len() > 2 && !arg.starts_with("--"))
 }
 
-fn is_remote_helper_exec_option(arg: &str) -> bool {
-    matches!(arg, "--receive-pack" | "--upload-pack" | "--exec")
+fn is_remote_helper_exec_option(arg: &str, subcommand: &str) -> bool {
+    if matches!(arg, "--receive-pack" | "--upload-pack" | "--exec")
         || arg.starts_with("--receive-pack=")
         || arg.starts_with("--upload-pack=")
         || arg.starts_with("--exec=")
+    {
+        return true;
+    }
+    // `git clone -u <upload-pack>` is the short form of --upload-pack.
+    // (`git push -u` is --set-upstream and must NOT match.)
+    if subcommand == "clone"
+        && (arg == "-u" || (arg.starts_with("-u") && arg.len() > 2 && !arg.starts_with("--")))
+    {
+        return true;
+    }
+    false
+}
+
+fn is_ext_transport_url(arg: &str) -> bool {
+    let a = arg.trim();
+    a.starts_with("ext::") || a.contains("ext::") || a.to_ascii_lowercase().starts_with("ext::")
 }
 
 fn is_push_delete_flag(arg: &str) -> bool {
@@ -903,6 +936,10 @@ fn is_command_launching_config_key(key: &str) -> bool {
     if k == "credential.helper" || (k.starts_with("credential.") && k.ends_with(".helper")) {
         return true;
     }
+    // Enables git-remote-ext command transports.
+    if k == "protocol.ext.allow" || k.starts_with("protocol.ext.") {
+        return true;
+    }
     matches!(
         k.as_str(),
         "core.sshcommand"
@@ -960,9 +997,11 @@ pub fn gh_repo_selector(args: &[String]) -> Option<&str> {
     None
 }
 
-/// Normalize a GitHub repo selector or remote URL to `owner/repo` (lowercase).
+/// Normalize a GitHub repo selector or remote URL to `(host, owner/repo)` (lowercase).
+///
+/// Host defaults to `github.com` when the selector is bare `owner/repo`.
 #[must_use]
-pub fn normalize_github_repo_slug(spec: &str) -> Option<String> {
+pub fn normalize_github_repo_identity(spec: &str) -> Option<(String, String)> {
     let mut s = spec.trim().trim_end_matches('/').to_owned();
     if s.is_empty() {
         return None;
@@ -970,11 +1009,17 @@ pub fn normalize_github_repo_slug(spec: &str) -> Option<String> {
     if let Some(rest) = s.strip_suffix(".git") {
         s = rest.to_owned();
     }
+    let mut host = String::from("github.com");
     // scp-like: git@host:owner/repo
     if let Some(at) = s.find('@') {
-        if let Some(colon) = s[at..].find(':') {
-            let after = &s[at + colon + 1..];
+        if let Some(rel) = s[at..].find(':') {
+            let colon = at + rel;
+            let host_part = &s[at + 1..colon];
+            let after = &s[colon + 1..];
             if after.contains('/') && !after.contains("://") {
+                if !host_part.is_empty() {
+                    host = host_part.to_ascii_lowercase();
+                }
                 s = after.to_owned();
             }
         }
@@ -985,7 +1030,7 @@ pub fn normalize_github_repo_slug(spec: &str) -> Option<String> {
             break;
         }
     }
-    // Drop userinfo in URL path form user@host/owner/repo (rare after scp rewrite)
+    // Drop userinfo in URL path form user@host/owner/repo
     if let Some(at) = s.find('@') {
         if !s[..at].contains('/') {
             s = s[at + 1..].to_owned();
@@ -994,35 +1039,155 @@ pub fn normalize_github_repo_slug(spec: &str) -> Option<String> {
     let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
     let (owner, repo) = match parts.as_slice() {
         [owner, repo] => (*owner, *repo),
-        [host, owner, repo] => {
-            let _ = host;
+        [h, owner, repo] => {
+            // host/owner/repo or HOST/OWNER/REPO from -R
+            if h.contains('.') || *h == "github.com" || h.contains(':') {
+                host = h.split(':').next().unwrap_or(h).to_ascii_lowercase();
+            }
             (*owner, *repo)
         }
-        [host, _port_or_user, owner, repo] => {
-            let _ = host;
+        [h, _extra, owner, repo] => {
+            host = h.split(':').next().unwrap_or(h).to_ascii_lowercase();
             (*owner, *repo)
         }
         _ => return None,
     };
-    // host may include :port in first part for ssh://host:22/owner/repo — handled by 4-part match
     let owner = owner.split(':').next().unwrap_or(owner);
     if owner.is_empty() || repo.is_empty() {
         return None;
     }
-    Some(format!(
-        "{}/{}",
-        owner.to_ascii_lowercase(),
-        repo.to_ascii_lowercase()
+    Some((
+        host,
+        format!(
+            "{}/{}",
+            owner.to_ascii_lowercase(),
+            repo.to_ascii_lowercase()
+        ),
     ))
 }
 
-/// Whether two GitHub repo selectors refer to the same owner/repo.
+/// Normalize to `owner/repo` (lowercase), dropping host. Prefer
+/// [`normalize_github_repo_identity`] when host must be compared.
+#[must_use]
+pub fn normalize_github_repo_slug(spec: &str) -> Option<String> {
+    normalize_github_repo_identity(spec).map(|(_, slug)| slug)
+}
+
+/// Whether two GitHub repo selectors refer to the same host + owner/repo.
 #[must_use]
 pub fn github_repo_slugs_match(a: &str, b: &str) -> bool {
-    match (normalize_github_repo_slug(a), normalize_github_repo_slug(b)) {
-        (Some(x), Some(y)) => x == y,
+    match (
+        normalize_github_repo_identity(a),
+        normalize_github_repo_identity(b),
+    ) {
+        (Some((ha, sa)), Some((hb, sb))) => ha == hb && sa == sb,
         _ => false,
     }
+}
+
+/// Reject `git push` refspecs that update a remote branch other than `expected`.
+///
+/// Called from the supervisor when `--expected-branch` is known. Bare
+/// `git push` / `git push origin` (no refspec) is allowed because the pre-spawn
+/// branch check already ensures HEAD is on `expected`.
+pub fn reject_push_outside_expected_branch(args: &[String], expected: &str) -> Result<()> {
+    if args.first().map(String::as_str) != Some("push") {
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--all") {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::BranchMismatch,
+            message: "git push --all is not allowed under hive policy".to_owned(),
+        });
+    }
+    for dest in push_destination_names(&args[1..]) {
+        if !push_dest_matches_expected(&dest, expected) {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::BranchMismatch,
+                message: format!(
+                    "git push destination `{dest}` must match --expected-branch `{expected}`"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn push_dest_matches_expected(dest: &str, expected: &str) -> bool {
+    let d = dest.trim();
+    if d == "HEAD" {
+        return true;
+    }
+    let leaf = d
+        .strip_prefix("refs/heads/")
+        .or_else(|| d.strip_prefix("refs/remotes/origin/"))
+        .unwrap_or(d);
+    leaf == expected
+}
+
+/// Destination branch/ref names from push argv (after the `push` token).
+fn push_destination_names(args: &[String]) -> Vec<String> {
+    let mut i = 0;
+    let mut positionals: Vec<&str> = Vec::new();
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            positionals.extend(args[i + 1..].iter().map(String::as_str));
+            break;
+        }
+        if a.starts_with('-') {
+            // value-taking push options
+            if matches!(
+                a,
+                "--repo" | "--receive-pack" | "--exec" | "--push-option" | "-o" | "--signed"
+            ) {
+                i += 2;
+                continue;
+            }
+            if a.starts_with("--repo=")
+                || a.starts_with("--receive-pack=")
+                || a.starts_with("--exec=")
+                || a.starts_with("--push-option=")
+                || a.starts_with("--signed=")
+            {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        positionals.push(a);
+        i += 1;
+    }
+    // positionals: [repository] [refspec ...]
+    if positionals.is_empty() {
+        return Vec::new();
+    }
+    // First positional is usually the remote; remaining are refspecs.
+    // If only one positional and it contains ':', it is a refspec (no remote).
+    let refspecs: &[&str] = if positionals.len() == 1 && positionals[0].contains(':') {
+        &positionals[..]
+    } else if positionals.len() == 1 {
+        // remote only, or single bare branch name without remote — treat as branch dest
+        // `git push origin` has no dest; `git push main` is unusual (remote named main).
+        // Prefer no dest constraint for single non-refspec token.
+        return Vec::new();
+    } else {
+        &positionals[1..]
+    };
+    let mut dests = Vec::new();
+    for rs in refspecs {
+        let rs = rs.strip_prefix('+').unwrap_or(rs);
+        if let Some((_src, dst)) = rs.split_once(':') {
+            if !dst.is_empty() {
+                dests.push(dst.to_owned());
+            }
+        } else if !rs.is_empty() {
+            // bare ref name: src and dest share the name
+            dests.push((*rs).to_owned());
+        }
+    }
+    dests
 }
 
 /// Resolve `origin` remote URL for a repo and return `owner/repo` if parseable.
@@ -1673,6 +1838,83 @@ mod tests {
         );
         assert!(github_repo_slugs_match("Acme/Repo", "github.com/acme/repo"));
         assert!(!github_repo_slugs_match("Acme/Repo", "other/repo"));
+        // Host is part of identity: enterprise origin must not match github.com -R.
+        assert!(!github_repo_slugs_match(
+            "git@github.enterprise:acme/repo.git",
+            "github.com/acme/repo"
+        ));
+        assert!(github_repo_slugs_match(
+            "git@github.enterprise:acme/repo.git",
+            "github.enterprise/acme/repo"
+        ));
+    }
+
+    #[test]
+    fn push_refspec_to_other_branch_rejected() {
+        let err = reject_push_outside_expected_branch(
+            &[
+                "push".to_owned(),
+                "origin".to_owned(),
+                "HEAD:main".to_owned(),
+            ],
+            "feature",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::BranchMismatch,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn push_to_expected_branch_ok() {
+        reject_push_outside_expected_branch(
+            &[
+                "push".to_owned(),
+                "origin".to_owned(),
+                "HEAD:feature".to_owned(),
+            ],
+            "feature",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn clone_u_upload_pack_rejected() {
+        let err = SafeGitCommand::new(&[
+            "clone".to_owned(),
+            "-u".to_owned(),
+            "sh -c true".to_owned(),
+            "https://example.com/r.git".to_owned(),
+            "dst".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ext_transport_url_rejected() {
+        let err = SafeGitCommand::new(&[
+            "ls-remote".to_owned(),
+            "ext::gh pr merge 1 --merge".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
     }
 
     #[test]

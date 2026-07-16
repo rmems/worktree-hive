@@ -501,6 +501,9 @@ fn prepare_supervised_command(
                     });
                 }
             }
+            if let Some(exp) = expected.as_deref() {
+                crate::git_safe::reject_push_outside_expected_branch(&owned_args, exp)?;
+            }
             // Always spawn PATH `git`, never a user-supplied path-qualified binary.
             let repo = resolve_supervised_repo(options.repo.as_deref())?;
             let branch_check = expected.map(|expected_branch| BranchCheck {
@@ -781,9 +784,12 @@ async fn drain_pipes_until(
         biased;
         _ = tokio::time::sleep_until(deadline_at) => {
             kill_process_group(pid);
-            // Dropping `drain` cancels the await; JoinHandles are dropped with the future,
-            // which aborts the reader tasks.
-            Err((Vec::new(), Vec::new()))
+            // Do not abort pipe readers: after the kill, pipes close and readers finish.
+            // Preserve any bytes already captured (Codex: empty output on drain timeout).
+            match tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, &mut drain).await {
+                Ok(out) => Err(out),
+                Err(_) => Err((Vec::new(), Vec::new())),
+            }
         }
         out = &mut drain => Ok(out),
     }
