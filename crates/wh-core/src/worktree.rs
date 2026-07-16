@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{Error, Result};
-use crate::paths::{derive_worktree_path, worktree_base_path};
+use crate::paths::{canonicalize_for_tools, derive_worktree_path, worktree_base_path};
 
 /// Result of a worktree creation operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,7 +38,9 @@ impl WorktreeManager {
             context: "create worktree base directory",
             source: e,
         })?;
-        let base = fs::canonicalize(&base).map_err(|e| Error::Io {
+        // Canonicalize for OS aliases (macOS /var → /private/var) but strip
+        // Windows `\\?\` so `git worktree add` accepts the path.
+        let base = canonicalize_for_tools(&base).map_err(|e| Error::Io {
             context: "canonicalize worktree base directory",
             source: e,
         })?;
@@ -447,16 +449,16 @@ fn reject_symlink_components_under(base: &Path, path: &Path) -> Result<()> {
 
 /// Check if a path is within the base directory (sandbox check).
 fn is_within_base(path: &Path, base: &Path) -> Result<bool> {
-    let canonical_path = fs::canonicalize(path).map_err(|e| Error::Io {
+    let canonical_path = canonicalize_for_tools(path).map_err(|e| Error::Io {
         context: "canonicalize candidate path",
         source: e,
     })?;
-    let canonical_base = fs::canonicalize(base).map_err(|e| Error::Io {
+    let canonical_base = canonicalize_for_tools(base).map_err(|e| Error::Io {
         context: "canonicalize base path",
         source: e,
     })?;
 
-    Ok(canonical_path.starts_with(canonical_base))
+    Ok(canonical_path.starts_with(&canonical_base))
 }
 
 /// Clean up empty parent directories up to the base.

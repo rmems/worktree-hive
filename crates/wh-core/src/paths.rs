@@ -134,6 +134,63 @@ pub fn derive_worktree_path(
     Ok(base.join(owner).join(repo).join(job_id))
 }
 
+/// Strip Windows verbatim (`\\?\`) prefixes that [`std::fs::canonicalize`] adds.
+///
+/// Git for Windows rejects `\\?\C:\...` paths for `worktree add` with
+/// "could not create leading directories ... Invalid argument". Keep resolved
+/// paths in the non-verbatim form that external tools accept.
+#[must_use]
+pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut components = path.components();
+        match components.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::VerbatimDisk(drive) => {
+                    let mut out = PathBuf::new();
+                    out.push(format!("{}:", drive as char));
+                    out.push(components.as_path());
+                    return out;
+                }
+                Prefix::VerbatimUNC(server, share) => {
+                    let mut out = PathBuf::from(format!(
+                        r"\\{}\{}",
+                        server.to_string_lossy(),
+                        share.to_string_lossy()
+                    ));
+                    out.push(components.as_path());
+                    return out;
+                }
+                Prefix::Verbatim(_) => {
+                    // Best-effort: fall through to OsStr strip below.
+                }
+                _ => return path,
+            },
+            _ => return path,
+        }
+        // Fallback string strip for Verbatim and odd cases.
+        let raw = path.as_os_str().to_string_lossy();
+        if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+            PathBuf::from(format!(r"\\{rest}"))
+        } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+            PathBuf::from(rest)
+        } else {
+            path
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
+/// Canonicalize a path and strip Windows verbatim prefixes for tool consumption.
+pub fn canonicalize_for_tools(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    Ok(strip_verbatim_prefix(canonical))
+}
+
 fn validate_path_segment(field: &'static str, value: &str) -> crate::error::Result<()> {
     use crate::error::Error;
     let invalid = value.is_empty()
