@@ -14,6 +14,19 @@ from worktrees_hives.attribution import (
     format_reply,
 )
 from worktrees_hives.bridge import WhClient
+from worktrees_hives.ci_taxonomy import (
+    CheckClass,
+    CheckConclusion,
+    CheckEntry,
+    ClassificationReport,
+    ClassifiedCheck,
+    Policy,
+    classify_check,
+    classify_checks,
+    parse_check_entry,
+    rerun_command,
+    should_rerun,
+)
 from worktrees_hives.contract import ErrorResponse, Response, SuccessResponse
 from worktrees_hives.errors import (
     PolicyError,
@@ -31,16 +44,18 @@ from worktrees_hives.orchestrator import (
     WorkerStatus,
 )
 
-__version__ = "0.1.0"
-
-__version__ = "0.1.0"
-
 __all__ = [
     "AttributionConfig",
     "AttributionPlacement",
+    "CheckClass",
+    "CheckConclusion",
+    "CheckEntry",
+    "ClassificationReport",
+    "ClassifiedCheck",
     "ErrorResponse",
     "Orchestrator",
     "OrchestratorReport",
+    "Policy",
     "PolicyError",
     "ReplyTemplate",
     "Response",
@@ -55,6 +70,11 @@ __all__ = [
     "WorkerSpec",
     "WorkerStatus",
     "__version__",
+    "classify_check",
+    "classify_checks",
     "format_attribution",
     "format_reply",
+    "parse_check_entry",
+    "rerun_command",
+    "should_rerun",
 ]

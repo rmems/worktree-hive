@@ -75,7 +75,8 @@ jobs:
         run: ruff format --check python/
 
       - name: Run mypy type checking
-        run: mypy python/src/ --ignore-missing-imports
+        working-directory: python
+        run: mypy --config-file pyproject.toml src
 
   test:
     name: test (Python ${{ matrix.python-version }})
