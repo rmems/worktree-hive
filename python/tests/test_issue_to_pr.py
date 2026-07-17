@@ -66,14 +66,15 @@ def _gh_cmd_from_calls(mock_run) -> list:
     raise AssertionError(f"no gh pr create in {mock_run.call_args_list!r}")
 
 
-def _happy_side_effect(gh_stdout: str = "https://github.com/acme/example-repo/pull/42\n") -> list[MagicMock]:
+def _happy_side_effect(
+    gh_stdout: str = "https://github.com/acme/example-repo/pull/42\n",
+) -> list[MagicMock]:
     """ensure branch + push + gh pr create."""
     return [
         *_ensure_branch_ok(),
         _ok(),  # push
         MagicMock(returncode=0, stdout=gh_stdout, stderr=""),
     ]
-
 
 
 # ---------------------------------------------------------------------------
@@ -116,9 +117,7 @@ class TestIssueToPrHappyPath:
 
         # git push succeeds
         # gh pr create succeeds
-        mock_run.side_effect = _happy_side_effect(
-            "https://github.com/acme/example-repo/pull/42\n"
-        )
+        mock_run.side_effect = _happy_side_effect("https://github.com/acme/example-repo/pull/42\n")
 
         orch = IssueToPr(config=cfg, wh_client=mock_wh)
         result = orch.run()
@@ -136,9 +135,7 @@ class TestIssueToPrHappyPath:
         mock_wh = MagicMock()
         mock_wh.run.return_value = _success_response()
 
-        mock_run.side_effect = _happy_side_effect(
-            "https://github.com/o/r/pull/1\n"
-        )
+        mock_run.side_effect = _happy_side_effect("https://github.com/o/r/pull/1\n")
 
         IssueToPr(config=cfg, wh_client=mock_wh).run()
 
@@ -153,9 +150,7 @@ class TestIssueToPrHappyPath:
         mock_wh = MagicMock()
         mock_wh.run.return_value = _success_response()
 
-        mock_run.side_effect = _happy_side_effect(
-            "https://github.com/o/r/pull/1\n"
-        )
+        mock_run.side_effect = _happy_side_effect("https://github.com/o/r/pull/1\n")
 
         IssueToPr(config=cfg, wh_client=mock_wh).run()
 
@@ -170,9 +165,7 @@ class TestIssueToPrHappyPath:
         mock_wh = MagicMock()
         mock_wh.run.return_value = _success_response()
 
-        mock_run.side_effect = _happy_side_effect(
-            "https://github.com/o/r/pull/1\n"
-        )
+        mock_run.side_effect = _happy_side_effect("https://github.com/o/r/pull/1\n")
 
         IssueToPr(config=cfg, wh_client=mock_wh).run()
 
@@ -518,9 +511,7 @@ class TestNeverMergeSafety:
         mock_wh = MagicMock()
         mock_wh.run.return_value = _success_response()
 
-        mock_run.side_effect = _happy_side_effect(
-            "https://github.com/o/r/pull/1\n"
-        )
+        mock_run.side_effect = _happy_side_effect("https://github.com/o/r/pull/1\n")
 
         IssueToPr(config=cfg, wh_client=mock_wh).run()
 
@@ -543,9 +534,7 @@ class TestNeverMergeSafety:
         mock_wh = MagicMock()
         mock_wh.run.return_value = _success_response()
 
-        mock_run.side_effect = _happy_side_effect(
-            "https://github.com/o/r/pull/1\n"
-        )
+        mock_run.side_effect = _happy_side_effect("https://github.com/o/r/pull/1\n")
 
         IssueToPr(config=cfg, wh_client=mock_wh).run()
 
@@ -567,9 +556,7 @@ class TestWhCreateCliShape:
         cfg = _make_config(repo_path="/tmp/repo")
         mock_wh = MagicMock()
         mock_wh.run.return_value = _success_response()
-        mock_run.side_effect = _happy_side_effect(
-            "https://github.com/acme/example-repo/pull/1\n"
-        )
+        mock_run.side_effect = _happy_side_effect("https://github.com/acme/example-repo/pull/1\n")
         IssueToPr(config=cfg, wh_client=mock_wh).run()
         args = mock_wh.run.call_args[0]
         assert args[0:3] == ("worktree", "create", "--repo")
@@ -619,9 +606,7 @@ class TestWhCreateCliShape:
         cfg = _make_config(base_branch="main", repo_path="/tmp/repo")
         mock_wh = MagicMock()
         mock_wh.run.return_value = _success_response()
-        mock_run.side_effect = _happy_side_effect(
-            "https://github.com/acme/example-repo/pull/1\n"
-        )
+        mock_run.side_effect = _happy_side_effect("https://github.com/acme/example-repo/pull/1\n")
         IssueToPr(config=cfg, wh_client=mock_wh).run()
         branch_cmd = None
         for call in mock_run.call_args_list:
