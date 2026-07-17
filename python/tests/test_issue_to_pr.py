@@ -61,10 +61,8 @@ def _gh_cmd_from_calls(mock_run) -> list:
     """Return the gh pr create argv from mock_run call list."""
     for call in mock_run.call_args_list:
         cmd = call[0][0]
-        if (cmd and cmd[0] in ("gh",)) or (isinstance(cmd, list) and "pr" in cmd and "create" in cmd):
-            # gh binary may be path; detect by presence of pr create
-            if "create" in cmd and "pr" in cmd:
-                return cmd
+        if isinstance(cmd, list) and "pr" in cmd and "create" in cmd:
+            return cmd
     raise AssertionError(f"no gh pr create in {mock_run.call_args_list!r}")
 
 
