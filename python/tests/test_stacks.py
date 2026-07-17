@@ -912,3 +912,89 @@ class TestMultiRepoAndDefaultBranchParents:
         stacks = detector.detect_stacks(prs)
         assert len(stacks) == 1
         assert {m.pr.number for m in stacks[0].members} == {30, 31}
+
+    def test_owner_repo_casing_still_forms_stack(self):
+        """Mismatched owner/repo casing between base and head still stacks."""
+        prs = [
+            PRInfo(
+                number=40,
+                head_ref="feat/base",
+                base_ref="main",
+                repo="Repo",
+                owner="Acme",
+                head_owner="acme",
+                head_repo="repo",
+            ),
+            PRInfo(
+                number=41,
+                head_ref="feat/child",
+                base_ref="feat/base",
+                repo="repo",
+                owner="acme",
+                head_owner="ACME",
+                head_repo="REPO",
+            ),
+        ]
+        detector = StackDetector(owner="acme", repo="repo", default_branch="main")
+        stacks = detector.detect_stacks(prs)
+        assert len(stacks) == 1
+        assert {m.pr.number for m in stacks[0].members} == {40, 41}
+
+
+class TestCodexReviewP2Fixes:
+    """Regression tests for remaining Codex P2 threads on PR #57."""
+
+    def test_allowlist_is_case_insensitive(self, detector: StackDetector):
+        prs = [
+            make_pr(1, "feat/base", "main", owner="AcMe"),
+            make_pr(2, "feat/child", "feat/base", owner="AcMe"),
+        ]
+        stacks = detector.detect_stacks(prs)
+        ordered = order_prs_bottom_up(stacks, [], allowed_owners={"acme"})
+        assert [pr.number for pr in ordered] == [1, 2]
+
+    def test_health_map_scoped_per_stack(self):
+        """Explicit health for one repo's #1 must not block another repo's stack."""
+        prs = [
+            make_pr(1, "feat-a", "main", repo="a"),
+            make_pr(2, "feat-a-2", "feat-a", repo="a"),
+            make_pr(1, "feat-b", "main", repo="b"),
+            make_pr(2, "feat-b-2", "feat-b", repo="b"),
+        ]
+        detector = StackDetector(owner=TEST_OWNER, repo="a", default_branch="main")
+        stacks = detector.detect_stacks(prs)
+        assert len(stacks) == 2
+        # Mark only repo a's bottom as conflicting; b should still process.
+        health = {
+            f"{TEST_OWNER}/a#1": PRState.CONFLICTING,
+            f"{TEST_OWNER}/a#2": PRState.OPEN,
+            f"{TEST_OWNER}/b#1": PRState.OPEN,
+            f"{TEST_OWNER}/b#2": PRState.OPEN,
+        }
+        ordered = order_prs_bottom_up(stacks, [], stack_health=health, allowed_owners=ALLOWED)
+        numbers_by_repo = {(pr.repo, pr.number) for pr in ordered}
+        # a#2 blocked by a#1 CONFLICTING health; b stack unaffected.
+        assert ("a", 2) not in numbers_by_repo
+        assert ("b", 1) in numbers_by_repo
+        assert ("b", 2) in numbers_by_repo
+
+    @patch("worktrees_hives.stacks.subprocess.run")
+    def test_resolve_repo_slug_from_local_path(self, mock_run):
+        detector = StackDetector(owner=TEST_OWNER, repo=TEST_REPO)
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"nameWithOwner": f"{OTHER_OWNER}/other-repo"}),
+            stderr="",
+        )
+        with patch("worktrees_hives.stacks.os.path.isdir", return_value=True):
+            slug = detector._resolve_repo_slug("/tmp/some-worktree")
+        assert slug == f"{OTHER_OWNER}/other-repo"
+        cmd = mock_run.call_args[0][0]
+        assert cmd[:4] == ["gh", "repo", "view", "--json"]
+        assert mock_run.call_args.kwargs.get("cwd") == "/tmp/some-worktree"
+
+    def test_resolve_allowed_owners_casefolds(self):
+        assert resolve_allowed_owners({"Limen-Neural", "RMEMS"}) == {
+            "limen-neural",
+            "rmems",
+        }

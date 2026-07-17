@@ -55,8 +55,8 @@ class PRInfo:
 
     @property
     def key(self) -> str:
-        """Unique key for dedup: owner/repo#number."""
-        return f"{self.owner}/{self.repo}#{self.number}"
+        """Unique key for dedup/health: owner/repo#number (case-normalized)."""
+        return f"{self.owner.casefold()}/{self.repo.casefold()}#{self.number}"
 
     def head_lives_in_base_repo(self) -> bool:
         """True when the head branch is in the PR's base repository (not a fork).
@@ -64,12 +64,13 @@ class PRInfo:
         ``head_owner``/``head_repo`` of ``None`` means "not provided" and is
         treated as same-repo for backwards-compatible test construction.
         Empty strings mean unknown/deleted head repo and never parent.
+        Comparison is case-insensitive (GitHub owner/repo names are).
         """
         if self.head_owner is None and self.head_repo is None:
             return True
         if not self.head_owner or not self.head_repo:
             return False
-        return self.head_owner == self.owner and self.head_repo == self.repo
+        return _same_repo(self.head_owner, self.head_repo, self.owner, self.repo)
 
 
 @dataclass(slots=True)
@@ -86,7 +87,7 @@ class StackMember:
         """Stable stack_health key for this member's parent (``owner/repo#n``)."""
         if self.parent is None:
             return None
-        return f"{self.pr.owner}/{self.pr.repo}#{self.parent}"
+        return f"{self.pr.owner.casefold()}/{self.pr.repo.casefold()}#{self.parent}"
 
     def _is_blocked(self, stack_health: dict[str, PRState] | None = None) -> bool:
         """True if this member's *immediate* parent isn't healthy.
@@ -210,10 +211,22 @@ DEFAULT_ALLOWED_OWNERS: frozenset[str] = frozenset()
 _WH_ALLOWED_OWNERS_ENV = "WH_ALLOWED_OWNERS"
 
 
+def _same_repo(owner_a: str, repo_a: str, owner_b: str, repo_b: str) -> bool:
+    """True when two (owner, repo) pairs name the same GitHub repository."""
+    return owner_a.casefold() == owner_b.casefold() and repo_a.casefold() == repo_b.casefold()
+
+
+def _normalize_owners(owners: set[str] | frozenset[str]) -> set[str]:
+    """Casefold owner names for allowlist membership checks."""
+    return {o.casefold() for o in owners if o}
+
+
 def load_allowed_owners_from_env(env: dict[str, str] | None = None) -> frozenset[str]:
     """Parse ``WH_ALLOWED_OWNERS`` (comma-separated owner names) into a frozenset.
 
-    Returns an empty set when the variable is unset or blank.
+    Returns an empty set when the variable is unset or blank. Owner names keep
+    their configured spelling; comparisons use casefold via
+    :func:`_owner_allowed` / :func:`resolve_allowed_owners`.
     """
     source = env if env is not None else os.environ
     raw = source.get(_WH_ALLOWED_OWNERS_ENV, "")
@@ -223,7 +236,7 @@ def load_allowed_owners_from_env(env: dict[str, str] | None = None) -> frozenset
 
 
 def resolve_allowed_owners(allowed_owners: set[str] | frozenset[str] | None = None) -> set[str]:
-    """Resolve the effective owner allowlist.
+    """Resolve the effective owner allowlist (casefolded for comparison).
 
     Precedence:
     1. Explicit ``allowed_owners`` argument (including empty set).
@@ -231,11 +244,11 @@ def resolve_allowed_owners(allowed_owners: set[str] | frozenset[str] | None = No
     3. :data:`DEFAULT_ALLOWED_OWNERS` (empty frozenset).
     """
     if allowed_owners is not None:
-        return set(allowed_owners)
+        return _normalize_owners(allowed_owners)
     env_owners = load_allowed_owners_from_env()
     if env_owners:
-        return set(env_owners)
-    return set(DEFAULT_ALLOWED_OWNERS)
+        return _normalize_owners(env_owners)
+    return _normalize_owners(DEFAULT_ALLOWED_OWNERS)
 
 
 def _parse_github_pr_state(
@@ -295,9 +308,10 @@ class StackDetector:
         if not prs:
             return []
 
+        # Group case-insensitively: GitHub owner/repo identity ignores case.
         groups: dict[tuple[str, str], list[PRInfo]] = {}
         for pr in prs:
-            groups.setdefault((pr.owner, pr.repo), []).append(pr)
+            groups.setdefault((pr.owner.casefold(), pr.repo.casefold()), []).append(pr)
 
         stacks: list[Stack] = []
         for group in groups.values():
@@ -346,8 +360,7 @@ class StackDetector:
                     p
                     for p in parent_candidates
                     if p.number != pr.number
-                    and p.owner == pr.owner
-                    and p.repo == pr.repo
+                    and _same_repo(p.owner, p.repo, pr.owner, pr.repo)
                     and p.head_lives_in_base_repo()
                 ),
                 None,
@@ -561,12 +574,45 @@ class StackDetector:
         return self.detect_stacks(prs)
 
     def _resolve_repo_slug(self, repo_path: str | None) -> str:
-        """Return owner/repo slug for gh API calls."""
+        """Return owner/repo slug for gh API calls.
+
+        - ``owner/repo`` string → used as-is when it is not a local directory.
+        - Local directory (or ``None``) → resolve via ``gh repo view
+          --json nameWithOwner`` with that cwd so a reused detector does not
+          query the constructor's owner/repo against a different checkout.
+        - Fallback → ``{self.owner}/{self.repo}`` when gh discovery fails.
+        """
         if repo_path and "/" in repo_path and not os.path.isdir(repo_path):
             # Validate a canonical owner/repo slug: exactly one non-empty slash pair.
             parts = repo_path.split("/")
             if len(parts) == 2 and parts[0] and parts[1]:
                 return repo_path
+
+        cwd = repo_path if repo_path and os.path.isdir(repo_path) else None
+        try:
+            result = subprocess.run(
+                [self._gh_bin, "repo", "view", "--json", "nameWithOwner"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+                cwd=cwd,
+            )
+            data = json.loads(result.stdout)
+            name = data.get("nameWithOwner")
+            if isinstance(name, str) and "/" in name:
+                parts = name.split("/")
+                if len(parts) == 2 and parts[0] and parts[1]:
+                    return name
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            FileNotFoundError,
+            OSError,
+            json.JSONDecodeError,
+            TypeError,
+        ):
+            pass
         return f"{self.owner}/{self.repo}"
 
     def _fetch_all_prs_from_gh(self, repo_path: str | None) -> list[dict[str, Any]]:
@@ -725,24 +771,29 @@ class StackDetector:
 def _health_for_stack(stack: Stack, stack_health: dict[str, PRState] | None) -> dict[str, PRState]:
     """Resolve stack health from explicit map or member PR states.
 
-    Keys are ``owner/repo#n`` (:attr:`PRInfo.key`), never bare integers.
+    Keys are case-normalized ``owner/repo#n`` (:attr:`PRInfo.key`), never bare
+    integers. When an explicit map is provided it is filtered to this stack's
+    members so multi-repo runs cannot apply another stack's health entries.
     """
-    if stack_health is not None:
-        return stack_health
-    return {m.pr.key: m.pr.state for m in stack.members}
+    if stack_health is None:
+        return {m.pr.key: m.pr.state for m in stack.members}
+    member_keys = {m.pr.key for m in stack.members}
+    return {k: v for k, v in stack_health.items() if k in member_keys}
 
 
 def _owner_allowed(pr: PRInfo, allowed_owners: set[str], allow_unlisted: bool) -> bool:
     """Return True if ``pr.owner`` is within the allowed owner set.
 
-    When ``allow_unlisted`` is False and ``allowed_owners`` is empty, nothing
-    is allowed (safe default).
+    Comparison is case-insensitive. ``allowed_owners`` is expected to already
+    be casefolded (as from :func:`resolve_allowed_owners`). When
+    ``allow_unlisted`` is False and ``allowed_owners`` is empty, nothing is
+    allowed (safe default).
     """
     if allow_unlisted:
         return True
     if not allowed_owners:
         return False
-    return pr.owner in allowed_owners
+    return pr.owner.casefold() in allowed_owners
 
 
 def order_prs_bottom_up(
