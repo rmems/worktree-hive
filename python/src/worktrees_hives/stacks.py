@@ -100,7 +100,9 @@ class StackMember:
         if stack_health is None:
             return True
         parent_key = self.parent_health_key()
-        assert parent_key is not None
+        if parent_key is None:
+            # parent is set above; None here is a programming error.
+            raise RuntimeError("parent_health_key() returned None with parent set")
         parent_state = stack_health.get(parent_key, PRState.UNKNOWN)
         return parent_state not in (PRState.OPEN, PRState.MERGED)
 
@@ -118,7 +120,8 @@ class StackMember:
         if self.parent is None:
             return True
         parent_key = self.parent_health_key()
-        assert parent_key is not None
+        if parent_key is None:
+            raise RuntimeError("parent_health_key() returned None with parent set")
         parent_state = stack_health.get(parent_key, PRState.UNKNOWN)
         return parent_state in (PRState.OPEN, PRState.MERGED)
 
@@ -175,7 +178,8 @@ class Stack:
             if member is None or member.parent is None:
                 return True  # reached base
             parent_key = member.parent_health_key()
-            assert parent_key is not None
+            if parent_key is None:
+                raise RuntimeError("parent_health_key() returned None with parent set")
             parent_state = stack_health.get(parent_key, PRState.UNKNOWN)
             if parent_state not in (PRState.OPEN, PRState.MERGED):
                 return False
