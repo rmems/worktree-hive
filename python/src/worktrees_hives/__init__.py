@@ -37,6 +37,13 @@ from worktrees_hives.ci_taxonomy import (
     rerun_command,
     should_rerun,
 )
+from worktrees_hives.claim import (
+    ClaimError,
+    ClaimExistsError,
+    ClaimManager,
+    ClaimResult,
+    IsolationError,
+)
 from worktrees_hives.contract import ErrorResponse, Response, SuccessResponse
 from worktrees_hives.errors import (
     PolicyError,
@@ -83,9 +90,14 @@ __all__ = [
     "CheckConclusion",
     "CheckEntry",
     "CheckRun",
+    "ClaimError",
+    "ClaimExistsError",
+    "ClaimManager",
+    "ClaimResult",
     "ClassificationReport",
     "ClassifiedCheck",
     "ErrorResponse",
+    "IsolationError",
     "IssueToPr",
     "IssueToPrConfig",
     "IssueToPrError",
