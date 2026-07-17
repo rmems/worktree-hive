@@ -327,8 +327,9 @@ def fetch_pr_checks(owner: str, repo: str, number: int) -> list[CheckRun]:
                 str(number),
                 "--repo",
                 f"{owner}/{repo}",
+                "--required",
                 "--json",
-                "name,state,link",
+                "name,state,bucket,link",
             ],
             check=False,
         )
@@ -350,16 +351,23 @@ def fetch_pr_checks(owner: str, repo: str, number: int) -> list[CheckRun]:
         raise ValueError(f"Failed to fetch PR checks for {owner}/{repo}#{number}: {detail}")
     if any(m in combined_lower for m in no_ci_markers) and result.returncode != 0:
         return []
+    # Non-JSON "no checks" text can appear with exit 0/1 before JSON exporter.
+    if any(m in combined_lower for m in no_ci_markers) and not raw.strip().startswith("["):
+        return []
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
+        if any(m in combined_lower for m in no_ci_markers):
+            return []
         if result.returncode != 0:
             detail = stderr.strip() or str(e)
             raise ValueError(
                 f"Failed to fetch PR checks for {owner}/{repo}#{number}: {detail}"
             ) from e
         raise ValueError(f"Failed to parse PR checks response: {e}") from e
-    terminal_conclusions = (
+    if not isinstance(data, list):
+        raise ValueError("PR checks response must be a JSON array")
+    terminal_conclusions = {
         "SUCCESS",
         "FAILURE",
         "ERROR",
@@ -367,16 +375,38 @@ def fetch_pr_checks(owner: str, repo: str, number: int) -> list[CheckRun]:
         "CANCELLED",
         "SKIPPED",
         "TIMED_OUT",
-    )
-    return [
-        CheckRun(
-            name=c.get("name", ""),
-            state=c.get("state", ""),
-            conclusion=c.get("state") if c.get("state") in terminal_conclusions else None,
-            link=c.get("link"),
+        "STARTUP_FAILURE",
+    }
+    # gh may report bucket=fail/pass/pending instead of conclusion.
+    bucket_map = {
+        "pass": "SUCCESS",
+        "fail": "FAILURE",
+        "pending": None,
+        "skipping": "SKIPPED",
+        "cancel": "CANCELLED",
+    }
+    checks: list[CheckRun] = []
+    for c in data:
+        if not isinstance(c, dict):
+            continue
+        state = str(c.get("state") or "")
+        bucket = str(c.get("bucket") or "").lower()
+        conclusion: str | None
+        if state.upper() in terminal_conclusions:
+            conclusion = state.upper()
+        elif bucket in bucket_map:
+            conclusion = bucket_map[bucket]
+        else:
+            conclusion = None
+        checks.append(
+            CheckRun(
+                name=str(c.get("name") or ""),
+                state=state or (bucket.upper() if bucket else ""),
+                conclusion=conclusion,
+                link=c.get("link"),
+            )
         )
-        for c in data
-    ]
+    return checks
 
 
 def fetch_review_threads(owner: str, repo: str, number: int) -> list[ReviewThread]:
@@ -548,6 +578,10 @@ def classify_pr(pr_data: dict[str, Any]) -> PRState:
     # Conflicts only — BEHIND is handled separately
     if mergeable == "CONFLICTING" or merge_state == "DIRTY":
         return PRState.CONFLICTING
+
+    # GitHub still computing the test merge — not ready / not healthy.
+    if mergeable == "UNKNOWN":
+        return PRState.PENDING_CI
 
     if merge_state == "BEHIND":
         return PRState.BEHIND
@@ -764,6 +798,18 @@ class BabysitCycle:
                 for sha in pushed_shas:
                     self._fix_shas.add(sha)
                 primary = pushed_shas[-1]
+                # Prefer live headRefOid when it matches a reported push SHA.
+                try:
+                    fresh = fetch_pr_status(self.owner, self.repo, self.pr_number)
+                    head = str(fresh.get("headRefOid") or "")
+                    if head:
+                        for s in pushed_shas:
+                            if head.startswith(s) or s.startswith(head[: max(7, min(len(s), 12))]):
+                                primary = head[:8]
+                                self._fix_shas.add(head)
+                                break
+                except (ValueError, subprocess.TimeoutExpired):
+                    pass
                 reply_body = f"Addressed in {primary}: {self.attribution}"
                 try:
                     reply_to_thread(

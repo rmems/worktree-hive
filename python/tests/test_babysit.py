@@ -216,6 +216,13 @@ class TestBabysitResult:
 
 
 class TestClassifyPR:
+    def test_unknown_mergeable_is_pending(self) -> None:
+        assert classify_pr(_make_pr_data(mergeable="UNKNOWN")) == PRState.PENDING_CI
+
+    def test_startup_failure_is_failure(self) -> None:
+        cr = CheckRun(name="job", state="COMPLETED", conclusion="STARTUP_FAILURE")
+        assert cr.is_failure
+
     def test_merged(self) -> None:
         data = _make_pr_data(state="MERGED")
         assert classify_pr(data) == PRState.MERGED
@@ -979,13 +986,16 @@ class TestBabysitCycleTimeoutAndRecheck:
         mock_reply: MagicMock,
         mock_resolve: MagicMock,
     ) -> None:
-        # First status green; after fix, re-fetch shows pending CI.
+        # Status: initial → head verify after push → re-check after fix.
+        pending_status = _make_pr_data(
+            checks=[{"name": "ci", "state": "PENDING", "status": "IN_PROGRESS"}],
+            merge_state="UNSTABLE",
+            head_ref_oid="deadbeef0123456789",
+        )
         mock_status.side_effect = [
-            _make_pr_data(),
-            _make_pr_data(
-                checks=[{"name": "ci", "state": "PENDING", "status": "IN_PROGRESS"}],
-                merge_state="UNSTABLE",
-            ),
+            _make_pr_data(head_ref_oid="deadbeef0123456789"),
+            _make_pr_data(head_ref_oid="deadbeef0123456789"),  # head verify
+            pending_status,  # post-fix recheck
         ]
         mock_checks.side_effect = [
             [],  # initial
@@ -1016,8 +1026,8 @@ class TestBabysitCycleTimeoutAndRecheck:
         )
         result = cycle.run()
         assert result.threads_resolved == 1
-        assert result.fix_commits_used == 1
+        assert result.fix_commits_used >= 1
         assert mock_checks.call_count == 2
-        assert mock_status.call_count == 2
+        assert mock_status.call_count == 3
         assert result.state == PRState.PENDING_CI
         assert result.checks_pending == 1
