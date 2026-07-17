@@ -46,6 +46,12 @@ from worktrees_hives.errors import (
     WhProcessError,
     WhSchemaError,
 )
+from worktrees_hives.issue_to_pr import (
+    IssueToPr,
+    IssueToPrConfig,
+    IssueToPrError,
+    IssueToPrResult,
+)
 from worktrees_hives.orchestrator import (
     Orchestrator,
     OrchestratorReport,
@@ -80,6 +86,10 @@ __all__ = [
     "ClassificationReport",
     "ClassifiedCheck",
     "ErrorResponse",
+    "IssueToPr",
+    "IssueToPrConfig",
+    "IssueToPrError",
+    "IssueToPrResult",
     "Orchestrator",
     "OrchestratorReport",
     "PRInfo",
