@@ -1,0 +1,19 @@
+python/tests/test_issue_to_pr.py
+  s_fbb7ec0a400c1c::t_0c48bb16f85404 421,427,431-432,434
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d94a902554a156cc1de23611a4d4c9c159550606",
+  "prompts": {},
+  "sessions": {
+    "s_fbb7ec0a400c1c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "94284c59-c81f-4cb3-9bb8-c46bc7a60b12",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Raul Montoya Cardenas <montoyaraul34@gmail.com>"
+    }
+  }
+}
