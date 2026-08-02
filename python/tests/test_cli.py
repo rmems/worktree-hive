@@ -1,0 +1,356 @@
+"""Tests for the worktrees-hives CLI surface.
+
+Covers the orchestration commands wired on top of the policy modules. Network
+and subprocess work is stubbed at the module boundary (``discover_all``,
+``fetch_pr_infos``, ``babysit_multiple``) so these tests exercise argument
+parsing, output rendering, the v1 JSON envelope, and the exit-code contract.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from worktrees_hives.babysit import BabysitResult
+from worktrees_hives.babysit import PRState as BabysitPRState
+from worktrees_hives.cli import main
+from worktrees_hives.discover import DiscoveryResult, Issue
+from worktrees_hives.errors import PolicyError
+from worktrees_hives.stacks import PRInfo
+from worktrees_hives.stacks import PRState as StackPRState
+
+OWNER = "acme"
+REPO = "widget"
+
+
+def _issue(number: int, *, is_pr: bool = False, repo: str = REPO, labels=None) -> Issue:
+    return Issue(
+        number=number,
+        title=f"Item {number}",
+        state="OPEN",
+        labels=labels or [],
+        milestone=None,
+        url=f"https://github.com/{OWNER}/{repo}/issues/{number}",
+        owner=OWNER,
+        repo=repo,
+        is_pr=is_pr,
+        assignees=[],
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-02T00:00:00Z",
+    )
+
+
+def _pr(number: int, head: str, base: str) -> PRInfo:
+    return PRInfo(
+        number=number,
+        head_ref=head,
+        base_ref=base,
+        repo=REPO,
+        owner=OWNER,
+        state=StackPRState.OPEN,
+    )
+
+
+def _envelope(capsys) -> dict:
+    """Parse the single JSON envelope written to stdout."""
+    out = capsys.readouterr().out.strip()
+    return json.loads(out)
+
+
+# ---------------------------------------------------------------------------
+# discover
+# ---------------------------------------------------------------------------
+
+
+class TestDiscover:
+    def test_human_output_groups_by_repo(self, monkeypatch, capsys):
+        result = DiscoveryResult(
+            issues=[_issue(2), _issue(1, labels=["bug"]), _issue(7, repo="other")],
+            errors=[],
+            owners_scanned=[OWNER],
+        )
+        monkeypatch.setattr("worktrees_hives.discover.discover_all", lambda **kw: result)
+        assert main(["discover", "--owner", OWNER]) == 0
+        out = capsys.readouterr().out
+        assert f"{OWNER}/{REPO}:" in out
+        assert f"{OWNER}/other:" in out
+        # Sorted numerically within a repo, not by insertion order.
+        assert out.index("#1") < out.index("#2")
+        assert "[bug]" in out
+        assert "3 item(s) across 1 owner(s)" in out
+
+    def test_json_envelope_uses_shared_serializer(self, monkeypatch, capsys):
+        result = DiscoveryResult(
+            issues=[_issue(4, is_pr=True)],
+            errors=[],
+            owners_scanned=[OWNER],
+        )
+        monkeypatch.setattr("worktrees_hives.discover.discover_all", lambda **kw: result)
+        assert main(["--json", "discover"]) == 0
+        env = _envelope(capsys)
+        assert env["ok"] is True
+        assert env["schema_version"] == 1
+        assert env["command"] == "discover"
+        assert env["data"]["total_issues"] == 1
+        assert env["data"]["issues"][0]["number"] == 4
+        assert env["data"]["issues"][0]["is_pr"] is True
+
+    def test_flags_are_forwarded(self, monkeypatch):
+        seen = {}
+
+        def fake(**kwargs):
+            seen.update(kwargs)
+            return DiscoveryResult(issues=[], errors=[], owners_scanned=[])
+
+        monkeypatch.setattr("worktrees_hives.discover.discover_all", fake)
+        main(
+            [
+                "discover",
+                "--owner",
+                "a",
+                "--owner",
+                "b",
+                "--kind",
+                "prs",
+                "--allow-non-default-owners",
+                "--no-check-auth",
+            ]
+        )
+        assert seen["owners"] == ["a", "b"]
+        assert seen["kind"] == "prs"
+        assert seen["allow_non_default_owners"] is True
+        # --no-check-auth inverts into check_auth=False.
+        assert seen["check_auth"] is False
+
+    def test_owner_defaults_to_none_for_env_fallback(self, monkeypatch):
+        seen = {}
+
+        def fake(**kwargs):
+            seen.update(kwargs)
+            return DiscoveryResult(issues=[], errors=[], owners_scanned=[])
+
+        monkeypatch.setattr("worktrees_hives.discover.discover_all", fake)
+        main(["discover"])
+        assert seen["owners"] is None
+
+    def test_truncation_and_errors_go_to_stderr(self, monkeypatch, capsys):
+        result = DiscoveryResult(
+            issues=[],
+            errors=["acme/widget: rate limited"],
+            owners_scanned=[OWNER],
+            truncated=True,
+        )
+        monkeypatch.setattr("worktrees_hives.discover.discover_all", lambda **kw: result)
+        assert main(["discover"]) == 0
+        err = capsys.readouterr().err
+        assert "truncated" in err
+        assert "rate limited" in err
+
+    def test_policy_error_exits_2(self, monkeypatch, capsys):
+        def boom(**kwargs):
+            raise PolicyError("OWNER_NOT_ALLOWED", "owner not allowed")
+
+        monkeypatch.setattr("worktrees_hives.discover.discover_all", boom)
+        assert main(["--json", "discover"]) == 2
+        env = _envelope(capsys)
+        assert env["ok"] is False
+        assert env["error"]["code"] == "OWNER_NOT_ALLOWED"
+
+    def test_value_error_exits_1(self, monkeypatch):
+        def boom(**kwargs):
+            raise ValueError("bad input")
+
+        monkeypatch.setattr("worktrees_hives.discover.discover_all", boom)
+        assert main(["discover"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# plan
+# ---------------------------------------------------------------------------
+
+
+class TestPlan:
+    @staticmethod
+    def _stub_repo(monkeypatch, prs: list[PRInfo]) -> None:
+        monkeypatch.setattr(
+            "worktrees_hives.stacks.StackDetector.fetch_pr_infos",
+            lambda self, repo_path=None: prs,
+        )
+
+    def test_requires_a_target(self, capsys):
+        assert main(["plan"]) == 1
+        assert "no targets" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("slug", ["notaslug", "a/b/c", "/repo", "owner/"])
+    def test_rejects_malformed_slug(self, slug):
+        assert main(["plan", "--repo", slug]) == 1
+
+    def test_orders_stack_bottom_up(self, monkeypatch, capsys):
+        # child (#2) sits on top of base (#1); base must come first.
+        self._stub_repo(
+            monkeypatch, [_pr(2, "feat/child", "feat/base"), _pr(1, "feat/base", "main")]
+        )
+        assert main(["plan", "--repo", f"{OWNER}/{REPO}", "--allow-unlisted"]) == 0
+        out = capsys.readouterr().out
+        assert out.index("#1") < out.index("#2")
+
+    def test_json_annotates_stack_position(self, monkeypatch, capsys):
+        self._stub_repo(
+            monkeypatch, [_pr(1, "feat/base", "main"), _pr(2, "feat/child", "feat/base")]
+        )
+        assert main(["--json", "plan", "--repo", f"{OWNER}/{REPO}", "--allow-unlisted"]) == 0
+        env = _envelope(capsys)
+        assert env["command"] == "plan"
+        ordered = env["data"]["ordered"]
+        assert [e["number"] for e in ordered] == [1, 2]
+        assert ordered[0]["stack_position"] == 0
+        assert ordered[1]["stack_position"] == 1
+        assert ordered[0]["stack_id"] == ordered[1]["stack_id"]
+
+    def test_standalone_pr_has_no_stack(self, monkeypatch, capsys):
+        self._stub_repo(monkeypatch, [_pr(9, "fix/typo", "main")])
+        main(["--json", "plan", "--repo", f"{OWNER}/{REPO}", "--allow-unlisted"])
+        entry = _envelope(capsys)["data"]["ordered"][0]
+        assert entry["stack_id"] is None
+        assert entry["number"] == 9
+
+    def test_owner_allowlist_denies_by_default(self, monkeypatch, capsys):
+        """Without --allow-unlisted and with no allowlist, nothing is scheduled."""
+        monkeypatch.delenv("WH_ALLOWED_OWNERS", raising=False)
+        self._stub_repo(monkeypatch, [_pr(1, "feat/base", "main")])
+        assert main(["plan", "--repo", f"{OWNER}/{REPO}"]) == 0
+        assert "No PRs to process" in capsys.readouterr().out
+
+    def test_repo_targets_are_deduped(self, monkeypatch, capsys):
+        self._stub_repo(monkeypatch, [_pr(1, "fix/a", "main")])
+        main(
+            [
+                "--json",
+                "plan",
+                "--repo",
+                f"{OWNER}/{REPO}",
+                "--repo",
+                f"{OWNER.upper()}/{REPO}",
+                "--allow-unlisted",
+            ]
+        )
+        assert len(_envelope(capsys)["data"]["ordered"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# babysit
+# ---------------------------------------------------------------------------
+
+
+class TestBabysit:
+    def test_forwards_arguments_in_given_order(self, monkeypatch):
+        seen = {}
+
+        def fake(**kwargs):
+            seen.update(kwargs)
+            return []
+
+        monkeypatch.setattr("worktrees_hives.babysit.babysit_multiple", fake)
+        main(
+            [
+                "babysit",
+                "--owner",
+                OWNER,
+                "--repo",
+                REPO,
+                "3",
+                "1",
+                "2",
+                "--max-fixes",
+                "2",
+                "--attribution",
+                "Test agent",
+            ]
+        )
+        assert seen["owner"] == OWNER
+        assert seen["repo"] == REPO
+        # Order is the caller's contract (bottom-up); the CLI must not re-sort.
+        assert seen["pr_numbers"] == [3, 1, 2]
+        assert seen["max_fixes"] == 2
+        assert seen["attribution"] == "Test agent"
+
+    def test_defaults_match_the_safety_cap(self, monkeypatch):
+        from worktrees_hives.babysit import DEFAULT_ATTRIBUTION, MAX_FIX_COMMITS_PER_CYCLE
+
+        seen = {}
+
+        def fake(**kwargs):
+            seen.update(kwargs)
+            return []
+
+        monkeypatch.setattr("worktrees_hives.babysit.babysit_multiple", fake)
+        main(["babysit", "--owner", OWNER, "--repo", REPO, "5"])
+        assert seen["max_fixes"] == MAX_FIX_COMMITS_PER_CYCLE
+        assert seen["attribution"] == DEFAULT_ATTRIBUTION
+
+    def test_human_output_never_claims_a_merge(self, monkeypatch, capsys):
+        results = [
+            BabysitResult(
+                pr_number=1,
+                state=BabysitPRState.HEALTHY,
+                residual_blockers=[],
+            )
+        ]
+        monkeypatch.setattr("worktrees_hives.babysit.babysit_multiple", lambda **kw: results)
+        assert main(["babysit", "--owner", OWNER, "--repo", REPO, "1"]) == 0
+        out = capsys.readouterr().out
+        assert "No PR was merged" in out
+        assert "merged successfully" not in out.lower()
+
+    def test_reports_residual_blockers(self, monkeypatch, capsys):
+        results = [
+            BabysitResult(
+                pr_number=4,
+                state=BabysitPRState.UNKNOWN,
+                residual_blockers=["CI red: build"],
+            )
+        ]
+        monkeypatch.setattr("worktrees_hives.babysit.babysit_multiple", lambda **kw: results)
+        main(["babysit", "--owner", OWNER, "--repo", REPO, "4"])
+        assert "CI red: build" in capsys.readouterr().out
+
+    def test_json_envelope(self, monkeypatch, capsys):
+        results = [
+            BabysitResult(
+                pr_number=4,
+                state=BabysitPRState.UNKNOWN,
+                residual_blockers=["conflict"],
+            )
+        ]
+        monkeypatch.setattr("worktrees_hives.babysit.babysit_multiple", lambda **kw: results)
+        assert main(["--json", "babysit", "--owner", OWNER, "--repo", REPO, "4"]) == 0
+        env = _envelope(capsys)
+        assert env["command"] == "babysit"
+        entry = env["data"]["results"][0]
+        assert entry["pr_number"] == 4
+        assert entry["residual_blockers"] == ["conflict"]
+
+    def test_non_integer_pr_number_is_rejected(self):
+        with pytest.raises(SystemExit):
+            main(["babysit", "--owner", OWNER, "--repo", REPO, "not-a-number"])
+
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestDispatch:
+    def test_watchlist_still_routes(self, tmp_path, capsys):
+        state = tmp_path / "wl.json"
+        assert main(["--state", str(state), "watchlist", "list"]) == 0
+        assert "No jobs in watchlist" in capsys.readouterr().out
+
+    def test_unknown_command_is_rejected(self):
+        with pytest.raises(SystemExit):
+            main(["nope"])
+
+    def test_missing_command_is_rejected(self):
+        with pytest.raises(SystemExit):
+            main([])

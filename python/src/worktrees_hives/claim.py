@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,11 +32,11 @@ from worktrees_hives.errors import (
     WhError,
     WhProcessError,
 )
+from worktrees_hives.paths import default_worktree_base
 
 if TYPE_CHECKING:
     from worktrees_hives.bridge import WhClient
 
-_WORKTREE_BASE_ENV = "WH_WORKTREE_BASE"
 _ALLOWED_OWNERS_ENV = "WH_ALLOWED_OWNERS"
 
 # Segment for owner / repo / job_id (no separators, no option-looking).
@@ -46,34 +45,6 @@ _SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _REF_RE = re.compile(r"^(?!-)[A-Za-z0-9][A-Za-z0-9._/-]*$")
 # Optional full SHA for PR pin documentation (not passed to create today).
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
-
-
-def _default_worktree_base() -> str:
-    """Platform-aware default under WH_WORKTREE_BASE / XDG / OS user-data dirs."""
-    if override := os.environ.get(_WORKTREE_BASE_ENV):
-        return override
-    if sys.platform == "win32":
-        local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
-        if local:
-            return os.path.join(local, "worktrees-hives", "worktrees")
-    if sys.platform == "darwin":
-        return os.path.join(
-            os.path.expanduser("~"),
-            "Library",
-            "Application Support",
-            "worktrees-hives",
-            "worktrees",
-        )
-    xdg = os.environ.get("XDG_DATA_HOME")
-    if xdg:
-        return os.path.join(xdg, "worktrees-hives", "worktrees")
-    return os.path.join(
-        os.path.expanduser("~"),
-        ".local",
-        "share",
-        "worktrees-hives",
-        "worktrees",
-    )
 
 
 def _load_allowed_owners_from_env() -> frozenset[str]:
@@ -132,7 +103,7 @@ class ClaimManager:
     """
 
     wh_client: WhClient
-    worktree_base: str = field(default_factory=_default_worktree_base)
+    worktree_base: str = field(default_factory=default_worktree_base)
     repo_root: str = field(default_factory=os.getcwd)
     allowed_owners: frozenset[str] | None = None
 

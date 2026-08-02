@@ -531,8 +531,17 @@ class StackDetector:
         """
         if default_branch:
             self.default_branch = default_branch
+        return self.detect_stacks(self.parse_pr_infos(pr_data))
 
-        prs = []
+    def parse_pr_infos(self, pr_data: list[dict[str, Any]]) -> list[PRInfo]:
+        """Parse ``gh``-shaped PR dicts into :class:`PRInfo`.
+
+        Malformed entries are skipped rather than raising: a single bad record
+        from ``gh`` must not abort scheduling for the whole repository.
+        Callers that need both stacks and standalone PRs (``find_standalone_prs``
+        takes the full PR list) use this to avoid re-implementing the mapping.
+        """
+        prs: list[PRInfo] = []
         for data in pr_data:
             if not isinstance(data, dict):
                 continue
@@ -563,19 +572,27 @@ class StackDetector:
             if not isinstance(head_repo, str):
                 head_repo = None
             mergeable = data.get("mergeable")
-            pr = PRInfo(
-                number=number,
-                head_ref=head_ref,
-                base_ref=base_ref,
-                repo=pr_repo,
-                owner=pr_owner,
-                state=_parse_github_pr_state(raw_state, merged_at, mergeable),
-                head_owner=head_owner,
-                head_repo=head_repo,
+            prs.append(
+                PRInfo(
+                    number=number,
+                    head_ref=head_ref,
+                    base_ref=base_ref,
+                    repo=pr_repo,
+                    owner=pr_owner,
+                    state=_parse_github_pr_state(raw_state, merged_at, mergeable),
+                    head_owner=head_owner,
+                    head_repo=head_repo,
+                )
             )
-            prs.append(pr)
+        return prs
 
-        return self.detect_stacks(prs)
+    def fetch_pr_infos(self, repo_path: str | None = None) -> list[PRInfo]:
+        """Fetch every PR for a repo via ``gh`` and return them as :class:`PRInfo`.
+
+        Includes closed and merged PRs so a child is not misclassified as
+        standalone when its parent branch has already landed.
+        """
+        return self.parse_pr_infos(self._fetch_all_prs_from_gh(repo_path))
 
     def _resolve_repo_slug(self, repo_path: str | None) -> str:
         """Return owner/repo slug for gh API calls.

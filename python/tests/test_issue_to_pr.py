@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import subprocess
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -453,21 +452,19 @@ class TestNamingHelpers:
         assert orch._branch_name() == "feature/issue-42"
 
     def test_worktree_path_default_base(self, monkeypatch):
+        """Path composition under the default base.
+
+        Platform resolution of the base itself lives in test_paths.py, which
+        exercises every branch on every runner.
+        """
         monkeypatch.delenv("WH_WORKTREE_BASE", raising=False)
-        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
         cfg = _make_config(owner="acme", repo="example-repo", issue_number=8)
         orch = IssueToPr(config=cfg, wh_client=MagicMock())
         path = orch._worktree_path()
         parts = Path(path).parts
         assert parts[-3:] == ("acme", "example-repo", "issue-8")
-        posix_path = path.replace("\\", "/")
-        if sys.platform == "win32":
-            assert "worktrees-hives" in parts
-            assert "worktrees" in parts
-        elif sys.platform == "darwin":
-            assert "Library/Application Support/worktrees-hives/worktrees" in posix_path
-        else:
-            assert ".local/share/worktrees-hives/worktrees" in posix_path
+        assert parts[-5:-3] == ("worktrees-hives", "worktrees")
+        assert Path(path).is_absolute()
 
     def test_worktree_path_custom_base(self, monkeypatch):
         monkeypatch.setenv("WH_WORKTREE_BASE", "/tmp/custom-wt")

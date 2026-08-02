@@ -1,21 +1,43 @@
 name: Qodana
+
 on:
   workflow_dispatch:
+  # Scope: the scan targets --project-dir=python, so only Python sources, the
+  # Qodana profile, and this workflow can change its result. Docs-only and
+  # Rust-only PRs are deliberately not scanned here (rust.yml covers those).
   pull_request:
+    paths:
+      - "python/**"
+      - ".github/workflows/qodana_code_quality.yml"
   push:
-    branches: # Specify your branches here
-      - main # The 'main' branch
-      - 'releases/*' # The release branches
+    branches:
+      - main
+      - 'releases/*'
+    paths:
+      - "python/**"
+      - ".github/workflows/qodana_code_quality.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default; the job re-grants only what the action needs.
+permissions:
+  contents: read
 
 jobs:
   qodana:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      # Read-only source access is enough: push-fixes is left at its "none"
+      # default, so the scan never commits a baseline or quick-fix.
+      contents: read
+      # Required by the action's post-pr-comment default (results summary).
       pull-requests: write
+      # Required by the action's use-annotations default (inline findings).
       checks: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           # PR head when present; otherwise the event SHA (push / workflow_dispatch).
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -23,7 +45,7 @@ jobs:
           # Do not leave the job token in .git after checkout: pip install -e runs
           # untrusted packaging code from the PR head.
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         id: setup-python
         with:
           python-version: '3.14'
@@ -31,7 +53,7 @@ jobs:
         working-directory: python
         run: pip install -e ".[test]"
       - name: 'Qodana Scan'
-        uses: JetBrains/qodana-action@v2026.1
+        uses: JetBrains/qodana-action@4861e015da555e86a72b862892aba6c2b93e6891 # v2026.1.3
         with:
           # PR-delta analysis only on pull_request; full scan on push/dispatch.
           pr-mode: ${{ github.event_name == 'pull_request' }}
@@ -42,6 +64,12 @@ jobs:
           # Never inject the cloud token into PR jobs: checkout head can control
           # qodana.yaml bootstrap and would run with QODANA_TOKEN in the environment.
           # Token is only for push/workflow_dispatch (trusted refs).
+          #
+          # Fork PRs: GitHub withholds secrets AND downgrades GITHUB_TOKEN to
+          # read-only, so the scan runs unauthenticated with no cloud upload and
+          # no PR comment. This is accepted, not a bug — a fork PR still gets a
+          # local community-linter scan, and the trusted push run on main
+          # produces the authoritative cloud report.
           QODANA_TOKEN: ${{ github.event_name != 'pull_request' && secrets.QODANA_TOKEN_1561455798 || '' }}
           QODANA_ENDPOINT: 'https://qodana.cloud'
           QODANA_PYTHON_PATH: ${{ steps.setup-python.outputs.python-path }}

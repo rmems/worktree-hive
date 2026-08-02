@@ -20,7 +20,6 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -28,6 +27,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from worktrees_hives.bridge import WhClient
 from worktrees_hives.contract import SuccessResponse
 from worktrees_hives.errors import WhError
+from worktrees_hives.paths import default_worktree_base
 
 # Remote names must be plain git remote identifiers — never option-looking values
 # that would be interpreted as flags by `git push` (e.g. `--force`, `-f`).
@@ -39,38 +39,6 @@ _BRANCH_NAME_RE = re.compile(r"^(?!-)[A-Za-z0-9][A-Za-z0-9._/\-]*$")
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-
-
-def _default_worktree_base() -> str:
-    """Platform-aware default under WH_WORKTREE_BASE / XDG / OS user-data dirs.
-
-    Kept aligned with ``claim._default_worktree_base`` (Windows LOCALAPPDATA,
-    macOS Application Support, else XDG / ``~/.local/share``).
-    """
-    if override := os.environ.get("WH_WORKTREE_BASE"):
-        return override
-    if sys.platform == "win32":
-        local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
-        if local:
-            return os.path.join(local, "worktrees-hives", "worktrees")
-    if sys.platform == "darwin":
-        return os.path.join(
-            os.path.expanduser("~"),
-            "Library",
-            "Application Support",
-            "worktrees-hives",
-            "worktrees",
-        )
-    xdg = os.environ.get("XDG_DATA_HOME")
-    if xdg:
-        return os.path.join(xdg, "worktrees-hives", "worktrees")
-    return os.path.join(
-        os.path.expanduser("~"),
-        ".local",
-        "share",
-        "worktrees-hives",
-        "worktrees",
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,7 +483,7 @@ class IssueToPr:
         """
         _validate_path_segment("owner", self._cfg.owner)
         _validate_path_segment("repo", self._cfg.repo)
-        base = _default_worktree_base()
+        base = default_worktree_base()
         job_id = f"issue-{self._cfg.issue_number}"
         path = str(Path(base) / self._cfg.owner / self._cfg.repo / job_id)
         # Defense in depth: resolved path must remain under the base.
