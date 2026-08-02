@@ -1,0 +1,20 @@
+python/src/worktrees_hives/cli.py
+  s_aa5a66b1d9c196::t_ca500a5cce0599 24-25
+  s_aa5a66b1d9c196::t_9e2860c25c5ad0 255
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "3ac27f9beb1a150d44be79ef6069dc7b17bf1b89",
+  "prompts": {},
+  "sessions": {
+    "s_aa5a66b1d9c196": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8a35768d-8fe3-48e9-b351-08bf02184b79",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Raul Montoya Cardenas <montoyaraul34@gmail.com>"
+    }
+  }
+}
